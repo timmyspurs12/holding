@@ -13,6 +13,7 @@ from __future__ import annotations
 import logging
 import os
 import time
+from contextlib import asynccontextmanager
 from typing import Any, Dict, List, Optional
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, status
@@ -34,8 +35,38 @@ RATE_LIMIT_PER_MINUTE = int(os.getenv("RATE_LIMIT_PER_MINUTE", "120") or 120)
 CORS_ORIGINS = [origin for origin in (os.getenv("CORS_ORIGINS") or "").split(",") if origin]
 
 
+def _seed_demo_corpus(app_state) -> None:
+    """In DEMO mode, populate the registry with the canonical loop.
+
+    Disabled with HOLDING_DEMO_SEED=false. Everything produced here is simulated
+    and labelled as such by the network block on every response.
+    """
+    config = app_state.config
+    if config.mode.value != "DEMO":
+        return
+    if os.getenv("HOLDING_DEMO_SEED", "true").lower() in ("0", "false", "no"):
+        return
+
+    from .routers.demo import SEED_CASES, run_case
+
+    shim = type("_StartupRequest", (), {})()
+    shim.app = type("_App", (), {"state": app_state})()
+
+    for case in SEED_CASES:
+        try:
+            run_case(shim, case["case_id"], case["facts"], settle=True)
+        except Exception as error:  # pragma: no cover - startup best effort
+            logger.warning("demo seed failed for %s: %s", case["case_id"], error)
+
+
 def create_app(config: Optional[GenLayerConfig] = None) -> FastAPI:
     config = config or GenLayerConfig.from_env()
+
+    @asynccontextmanager
+    async def lifespan(app: FastAPI):
+        _seed_demo_corpus(app.state)
+        yield
+
     app = FastAPI(
         title="HOLDING Reporter API",
         version="1.0.0",
@@ -43,6 +74,7 @@ def create_app(config: Optional[GenLayerConfig] = None) -> FastAPI:
             "Read and write access to the HOLDING precedent registry: a GenLayer "
             "Intelligent Contract that turns finalized adjudications into citable holdings."
         ),
+        lifespan=lifespan,
     )
     app.state.config = config
     app.state.limiter = RateLimiter(int(os.getenv("RATE_LIMIT_PER_MINUTE", RATE_LIMIT_PER_MINUTE) or RATE_LIMIT_PER_MINUTE))
@@ -62,28 +94,6 @@ def create_app(config: Optional[GenLayerConfig] = None) -> FastAPI:
 
     app.include_router(admin_router)
     app.include_router(demo_router)
-
-    @app.on_event("startup")
-    def seed_demo_corpus() -> None:
-        """In DEMO mode, populate the registry with the canonical loop.
-
-        Disabled with HOLDING_DEMO_SEED=false. Everything produced here is
-        simulated and labelled as such by the network block on every response.
-        """
-        if config.mode.value != "DEMO":
-            return
-        if os.getenv("HOLDING_DEMO_SEED", "true").lower() in ("0", "false", "no"):
-            return
-        from .routers.demo import SEED_CASES, run_case
-
-        shim = type("_StartupRequest", (), {})()
-        shim.app = type("_App", (), {"state": app.state})()
-
-        for case in SEED_CASES:
-            try:
-                run_case(shim, case["case_id"], case["facts"], settle=True)
-            except Exception as error:  # pragma: no cover - startup best effort
-                logger.warning("demo seed failed for %s: %s", case["case_id"], error)
 
     # -- dependencies -------------------------------------------------
     def registry():
