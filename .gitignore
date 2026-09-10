@@ -16,8 +16,8 @@ node_modules/
 .next/
 out/
 
-# local state
-data/
+# local state (root-anchored: `data/` alone would also match lib/data/)
+/data/
 *.db
 *.sqlite3
 
