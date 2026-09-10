@@ -1,0 +1,27 @@
+# secrets
+.env
+.env.local
+*.pem
+*.key
+
+# python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+
+# node
+node_modules/
+.next/
+out/
+
+# local state
+data/
+*.db
+*.sqlite3
+
+# tooling
+.mypy_cache/
+.ruff_cache/
+shots/

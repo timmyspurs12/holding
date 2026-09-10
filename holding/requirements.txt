@@ -1,0 +1,14 @@
+# Reporter API, indexer and demo runner.
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+pydantic==2.10.4
+python-dotenv==1.0.1
+
+# Tests
+pytest==8.3.4
+httpx==0.28.1
+
+# Live GenLayer access (only needed when GENLAYER_NETWORK is not `demo`).
+# Pinned to the current stable release; the consensus-v0.6 fee API is only in
+# the 0.19 release candidate, so the adapter does not use it.
+genlayer-py==0.18.0
