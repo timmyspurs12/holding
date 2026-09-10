@@ -1,0 +1,15 @@
+.git
+.github
+node_modules
+.next
+.env
+.env.*
+!.env.example
+data
+*.db
+__pycache__
+*.py[cod]
+.pytest_cache
+tests
+docs
+*.tsbuildinfo

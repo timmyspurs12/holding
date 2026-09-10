@@ -22,6 +22,7 @@ data/
 *.sqlite3
 
 # tooling
+*.tsbuildinfo
 .mypy_cache/
 .ruff_cache/
 shots/
