@@ -19,6 +19,20 @@ Usage
     # check the files and arguments without touching a network
     python scripts/deploy_contracts.py --dry-run
 
+    # resume a deploy that was SUBMITTED but not confirmed (read-only tracking,
+    # never resends the transaction):
+    python scripts/deploy_contracts.py --network bradbury --registry-tx 0xENVELOPE_HASH
+    # or, once you have the deployed address (explorer / check_deploy_tx.py):
+    python scripts/deploy_contracts.py --network bradbury --registry-address 0xADDRESS
+
+    # watch any submitted transaction without a key (pure web3, read-only):
+    python scripts/check_deploy_tx.py 0xENVELOPE_HASH --watch
+
+Exit codes: 0 success · 1 FAILED (EVM revert / consensus canceled / bad decision)
+· 2 UNKNOWN (envelope not propagated / dropped — investigate the printed
+diagnostics) · 3 still PENDING/PROCESSING (resume with the printed command)
+· 4 finalized but the record did not expose the contract address.
+
 Notes
 -----
 * Consensus v0.6 requires fee fields on every deploy and write. Those exist in
@@ -35,7 +49,7 @@ Notes
 from __future__ import annotations
 
 # Bump with every fix. Printed at startup so a stale copy is obvious.
-BUILD_ID = "2026-09-11.c (pre-fee consensus ABI fallback, fee retry, finality timeout)"
+BUILD_ID = "2026-09-12.a (status-aware finality tracking, resume from submitted tx, read-only tx checker)"
 
 import argparse
 import copy
@@ -82,6 +96,24 @@ EXPLORERS = {
     "studio_devnet": "https://studio-dev.genlayer.com",
     "studionet": "https://studio.genlayer.com",
     "localnet": "http://127.0.0.1:4000/api",
+}
+
+# A GenLayer write has TWO layers with TWO different hashes:
+#   L2 (EVM)    the "envelope" tx — an EIP-1559 call to the consensus
+#               contract's addTransaction. "In the chain" means its EVM
+#               receipt exists (eth_getTransactionReceipt != null). This is
+#               the hash eth_sendRawTransaction returns.
+#   consensus   the GenLayer lifecycle of the consensus txId registered from
+#               the envelope's NewTransaction/CreatedTransaction logs:
+#               Pending → Proposing → Committing → Revealing → Accepted →
+#               Finalized (or Canceled / timeout). Only exists once the
+#               envelope is mined. The GenLayer explorer is keyed by this
+#               hash; the EVM-layer explorer is keyed by the envelope hash.
+# Bradbury's EVM layer is a ZKsync chain, so envelope txs are inspectable
+# there (the GenLayer explorer answers "details unavailable" for an envelope
+# hash even when the tx is healthy, because it keys on the consensus txId).
+EVM_EXPLORERS = {
+    "testnet_bradbury": "https://zksync-os-testnet-genlayer.explorer.zksync.dev",
 }
 
 
@@ -285,6 +317,439 @@ def extract_tx_hash(error) -> str:
     return match.group(0) if match else ""
 
 
+# ── status-aware post-submission tracking ─────────────────────────────
+#
+# The SDK's deploy_contract/write_contract internally wait for the EVM
+# receipt of the addTransaction envelope with a blind timeout (web3
+# "is not in the chain after N seconds") and only then return the consensus
+# txId. When that wait expires, the transaction may still be alive, so we
+# keep tracking it read-only. Every wait below distinguishes:
+#
+#   PENDING      envelope in the L2 mempool, or consensus pending
+#   PROCESSING   envelope mined and the consensus lifecycle moving
+#                (incl. ACCEPTED waiting out the appeal window)
+#   FINALIZED    consensus FINALIZED with an accepted execution
+#   FAILED       EVM revert, consensus canceled, or a non-accepted decision
+#   UNKNOWN      envelope visible nowhere (dropped / not propagated)
+#   SUPERSEDED   the envelope's nonce slot was used by another transaction
+#
+# None of these paths ever resends a transaction.
+
+STATUS_PENDING = "PENDING"
+STATUS_PROCESSING = "PROCESSING"
+STATUS_FINALIZED = "FINALIZED"
+STATUS_FAILED = "FAILED"
+STATUS_UNKNOWN = "UNKNOWN"
+STATUS_SUPERSEDED = "SUPERSEDED"
+
+EXIT_OK = 0
+EXIT_FAILED = 1
+EXIT_UNKNOWN = 2
+EXIT_PROCESSING = 3
+EXIT_NO_ADDRESS = 4
+
+ZERO_ADDRESS = "0x0000000000000000000000000000000000000000"
+
+
+def mmss(seconds: float) -> str:
+    seconds = int(seconds)
+    return f"{seconds // 60:02d}:{seconds % 60:02d}"
+
+
+def probe_envelope(client, envelope: str, sender: str = "") -> dict:
+    """Read-only snapshot of the EVM-layer state of an envelope tx.
+
+    `sender` is the known deployer address. When the tx object has vanished
+    (dropped from the mempool), the account diagnostics still come from it,
+    which is what lets the drop-cause analysis reason about balance/nonce.
+    """
+    w3 = client.w3
+    probe = {
+        "state": STATUS_UNKNOWN,
+        "tx": None,
+        "receipt": None,
+        "nonce_latest": None,
+        "nonce_pending": None,
+        "balance": None,
+        "base_fee": None,
+        "gas_price": None,
+        "block_number": None,
+        "detail": "",
+    }
+    try:
+        probe["tx"] = w3.eth.get_transaction(envelope)
+    except Exception as error:  # noqa: BLE001
+        probe["detail"] = f"eth_getTransactionByHash failed: {str(error).splitlines()[0][:100]}"
+    tx = probe["tx"]
+    if tx is None:
+        probe["state"] = STATUS_UNKNOWN
+    elif tx.get("blockNumber") is None:
+        probe["state"] = STATUS_PENDING
+    else:
+        try:
+            probe["receipt"] = w3.eth.get_transaction_receipt(envelope)
+        except Exception:  # noqa: BLE001
+            probe["receipt"] = None
+        receipt = probe["receipt"]
+        if receipt is None:
+            probe["state"] = STATUS_PENDING
+        elif receipt.get("status") == 1:
+            probe["state"] = "MINED"
+        else:
+            probe["state"] = STATUS_FAILED
+            probe["detail"] = "EVM tx reverted (L2 receipt status=0)"
+    if probe["state"] in (STATUS_PENDING, STATUS_UNKNOWN):
+        account = (tx or {}).get("from") or sender
+        tx_nonce = (tx or {}).get("nonce")
+        if account:
+            try:
+                probe["nonce_latest"] = w3.eth.get_transaction_count(account)
+                probe["nonce_pending"] = w3.eth.get_transaction_count(account, "pending")
+                probe["balance"] = w3.eth.get_balance(account)
+            except Exception:  # noqa: BLE001
+                pass
+            # Only meaningful while the tx object is visible: its nonce slot
+            # being consumed by a DIFFERENT tx means it can never mine.
+            if (
+                probe["state"] == STATUS_PENDING
+                and tx_nonce is not None
+                and probe["nonce_latest"] is not None
+                and probe["nonce_latest"] > tx_nonce
+            ):
+                probe["state"] = STATUS_SUPERSEDED
+                probe["detail"] = f"nonce slot {tx_nonce} was already used by another transaction"
+    try:
+        latest = w3.eth.get_block("latest")
+        probe["base_fee"] = latest.get("baseFeePerGas")
+        probe["block_number"] = latest.get("number")
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        probe["gas_price"] = w3.eth.gas_price
+    except Exception:  # noqa: BLE001
+        pass
+    return probe
+
+
+def envelope_diagnostics(probe: dict) -> list[str]:
+    lines = []
+    if probe["block_number"] is not None:
+        lines.append(f"chain head block {probe['block_number']}")
+    if probe["base_fee"] is not None:
+        lines.append(f"block base fee {probe['base_fee'] / 1e9:.3f} gwei")
+    if probe["gas_price"] is not None:
+        lines.append(f"network gas price {probe['gas_price'] / 1e9:.3f} gwei")
+    if probe["nonce_latest"] is not None:
+        extra = ""
+        if probe["nonce_pending"] is not None and probe["nonce_pending"] > probe["nonce_latest"]:
+            extra = f" (+{probe['nonce_pending'] - probe['nonce_latest']} pending in mempool)"
+        lines.append(f"account nonce {probe['nonce_latest']}{extra}")
+    if probe["balance"] is not None:
+        lines.append(f"account balance {probe['balance'] / 1e18:.6f} GEN")
+    return lines
+
+
+def likely_dropped_cause(probe: dict) -> str:
+    base_fee = probe["base_fee"] or 0
+    gas_price = probe["gas_price"]
+    # genlayer-py 0.19 builds the envelope with maxFeePerGas = baseFee + 2 gwei
+    sdk_max_fee = base_fee + 2_000_000_000
+    if gas_price is not None and gas_price > sdk_max_fee:
+        return (
+            f"likely cause: the SDK's maxFeePerGas (block base fee + 2 gwei = "
+            f"{sdk_max_fee / 1e9:.3f} gwei) is below the current network gas price "
+            f"({gas_price / 1e9:.3f} gwei) — the sequencer never included it, so it "
+            f"aged out of the mempool"
+        )
+    if probe["balance"] is not None and gas_price is not None and probe["balance"] < gas_price * 5_000_000:
+        return "likely cause: account balance is below gas price × a deploy-size gas limit — the tx was dropped for lack of funds"
+    if probe["nonce_pending"] is not None and probe["nonce_latest"] is not None and probe["nonce_pending"] > probe["nonce_latest"]:
+        return "likely cause: the tx may still be queued behind other pending transactions of the same account"
+    return "likely cause: the tx was not propagated from the RPC node to the block producer (or was dropped) — re-sending is safe only after you have confirmed it is absent from every node you used"
+
+
+def _print_envelope_state(label: str, elapsed: float, probe: dict) -> None:
+    state = probe["state"]
+    clock = mmss(elapsed)
+    if state == "MINED":
+        receipt = probe["receipt"] or {}
+        block = receipt.get("blockNumber") or (probe["tx"] or {}).get("blockNumber")
+        print(f"  … {label:<17} {clock}  MINED    (block {block})")
+    elif state == STATUS_PENDING:
+        print(f"  … {label:<17} {clock}  PENDING  (in the L2 mempool — not in a block yet)")
+    elif state == STATUS_FAILED:
+        print(f"  … {label:<17} {clock}  FAILED   ({probe['detail']})")
+    elif state == STATUS_SUPERSEDED:
+        print(f"  … {label:<17} {clock}  FAILED   ({probe['detail']})")
+    else:
+        print(f"  … {label:<17} {clock}  UNKNOWN  (no block, not in this node's mempool)")
+    if state == STATUS_UNKNOWN:
+        for line in envelope_diagnostics(probe):
+            print(f"      {line}")
+
+
+def wait_for_envelope(client, envelope: str, label: str, timeout_s: float,
+                      interval_s: float = 5.0, print_every_s: float = 30.0,
+                      sender: str = "") -> dict:
+    """Status-aware L2-inclusion wait. Read-only: never resends the tx."""
+    start = time.monotonic()
+    deadline = start + timeout_s
+    last_state, last_print = None, -1e9
+    while True:
+        probe = probe_envelope(client, envelope, sender)
+        state = probe["state"]
+        elapsed = time.monotonic() - start
+        if state != last_state or elapsed - last_print >= print_every_s:
+            _print_envelope_state(label, elapsed, probe)
+            last_state, last_print = state, elapsed
+        if state in ("MINED", STATUS_FAILED, STATUS_SUPERSEDED):
+            return probe
+        if time.monotonic() >= deadline:
+            return probe  # PENDING or UNKNOWN at budget end — caller reports
+        time.sleep(interval_s)
+
+
+def consensus_tx_id_from_receipt(w3, receipt, consensus_address: str) -> str:
+    """Decode the consensus txId from the envelope receipt's logs.
+
+    The consensus contract emits NewTransaction(bytes32 txId, address
+    recipient, address activator) when a tx is immediately activated, or
+    CreatedTransaction(bytes32 txId, uint256 txSlot) when it is queued.
+    """
+    if not receipt:
+        return ""
+    new_topic = w3.keccak(text="NewTransaction(bytes32,address,address)").hex()
+    created_topic = w3.keccak(text="CreatedTransaction(bytes32,uint256)").hex()
+    consensus_address = consensus_address.lower()
+    for log in receipt.get("logs") or []:
+        topics = log.get("topics") or []
+        if len(topics) < 2:
+            continue
+        if (log.get("address") or "").lower() != consensus_address:
+            continue
+        if topics[0].hex() in (new_topic, created_topic):
+            return "0x" + topics[1].hex()
+    return ""
+
+
+def probe_consensus(client, tx_id: str) -> dict:
+    """Read-only snapshot of the consensus lifecycle for a registered txId."""
+    probe = {"state": STATUS_UNKNOWN, "phase": "", "outcome": "", "tx": None, "detail": ""}
+    try:
+        tx = client.get_transaction(tx_id=tx_id)
+    except Exception as error:  # noqa: BLE001
+        probe["detail"] = f"consensus record not readable: {str(error).splitlines()[0][:100]}"
+        return probe
+    if not isinstance(tx, dict):
+        probe["detail"] = "unexpected consensus record shape"
+        return probe
+    probe["tx"] = tx
+    lifecycle = tx.get("lifecycle")
+    if not isinstance(lifecycle, dict):
+        probe["detail"] = "consensus record has no lifecycle (not registered?)"
+        return probe
+    state = str(lifecycle.get("state") or "")
+    phase = str(lifecycle.get("phase") or "")
+    outcome = str(lifecycle.get("outcome") or "")
+    probe["phase"], probe["outcome"] = phase, outcome
+    if state == "finalized":
+        if outcome in ("", "accepted"):
+            probe["state"] = STATUS_FINALIZED
+        else:
+            probe["state"] = STATUS_FAILED
+            probe["detail"] = f"finalized with outcome {outcome}"
+    elif state == "canceled":
+        probe["state"] = STATUS_FAILED
+        probe["detail"] = "canceled before finalization"
+    elif state == "decided":
+        if outcome == "accepted":
+            probe["state"] = STATUS_PROCESSING
+            probe["phase"] = "accepted — appeal window / finalization pending"
+        else:
+            probe["state"] = STATUS_FAILED
+            probe["detail"] = f"decided with outcome {outcome}"
+    elif state == "processing":
+        probe["state"] = STATUS_PENDING if phase in ("", "pending", "uninitialized") else STATUS_PROCESSING
+    else:
+        probe["detail"] = f"unrecognized lifecycle state {state!r}"
+    # An accepted-but-erroring execution still has to be reported as failed.
+    if probe["state"] == STATUS_FINALIZED:
+        name = tx.get("tx_execution_result_name") or tx.get("tx_execution_result")
+        if name not in (None, "", "FINISHED_WITH_RETURN", 1):
+            probe["state"] = STATUS_FAILED
+            probe["detail"] = f"finalized with execution result {name}"
+    return probe
+
+
+def _print_consensus_state(label: str, elapsed: float, probe: dict) -> None:
+    state = probe["state"]
+    clock = mmss(elapsed)
+    if state == STATUS_FINALIZED:
+        print(f"  … {label:<17} {clock}  FINALIZED (accepted)")
+    elif state == STATUS_FAILED:
+        print(f"  … {label:<17} {clock}  FAILED    ({probe['detail']})")
+    elif state == STATUS_PENDING:
+        print(f"  … {label:<17} {clock}  PENDING   (consensus {probe['phase'] or 'pending'})")
+    elif state == STATUS_PROCESSING:
+        print(f"  … {label:<17} {clock}  PROCESSING ({probe['phase'] or 'in progress'})")
+    else:
+        print(f"  … {label:<17} {clock}  UNKNOWN   ({probe['detail']})")
+
+
+def wait_for_consensus(client, tx_id: str, label: str, timeout_s: float,
+                       interval_s: float = 10.0, print_every_s: float = 30.0) -> dict:
+    """Status-aware consensus-finality wait. Read-only: never resends the tx."""
+    start = time.monotonic()
+    deadline = start + timeout_s
+    last_state, last_print = None, -1e9
+    while True:
+        probe = probe_consensus(client, tx_id)
+        state = probe["state"]
+        elapsed = time.monotonic() - start
+        if state != last_state or elapsed - last_print >= print_every_s:
+            _print_consensus_state(label, elapsed, probe)
+            last_state, last_print = state, elapsed
+        if state in (STATUS_FINALIZED, STATUS_FAILED):
+            return probe
+        if time.monotonic() >= deadline:
+            return probe  # still PENDING/PROCESSING — caller reports + resume cmd
+        time.sleep(interval_s)
+
+
+def contract_address_of(tx_simplified) -> str:
+    """Extract the deployed contract address from a finalized deploy tx.
+
+    On GenLayer the EVM envelope receipt has NO contractAddress (the envelope
+    calls the consensus contract, it is not a CREATE). The created address
+    lives in the consensus record — the stored recipient of a deploy — which
+    genlayer-py surfaces as data.contract_address / recipient.
+    """
+    address = contract_address(tx_simplified)
+    if address and address.lower() != ZERO_ADDRESS:
+        return address
+    if isinstance(tx_simplified, dict):
+        for key in ("recipient", "to_address"):
+            value = tx_simplified.get(key)
+            if value and str(value).lower() != ZERO_ADDRESS:
+                return str(value)
+    return ""
+
+
+def print_resume_hint(args, envelope: str = "", tx_id: str = "", address: str = "") -> None:
+    """Print the exact commands that resume without redeploying anything."""
+    print("  resume without redeploying (read-only until it re-submits nothing):")
+    if address:
+        print(f"      python scripts/deploy_contracts.py --network {args.network} "
+              f"--registry-address {address} --write-env")
+    elif tx_id:
+        print(f"      python scripts/deploy_contracts.py --network {args.network} "
+              f"--registry-tx {tx_id} --write-env")
+    elif envelope:
+        print(f"      python scripts/deploy_contracts.py --network {args.network} "
+              f"--registry-tx {envelope} --write-env")
+    print(f"  or track it live:  python scripts/check_deploy_tx.py "
+          f"{envelope or tx_id or address} --watch")
+
+
+def finish_consensus(client, tx_id: str, label: str, explorer: str, args,
+                     need_address: bool = True) -> tuple[int, dict]:
+    """Wait for consensus finality (status-aware) and report the outcome.
+
+    Returns (exit_code, probe). exit codes: 0 FINALIZED · 1 FAILED ·
+    3 still PENDING/PROCESSING · 4 finalized but no address exposed.
+    """
+    probe = wait_for_consensus(client, tx_id, label, args.finality_timeout)
+    state = probe["state"]
+    if state == STATUS_FINALIZED:
+        if need_address:
+            address = contract_address_of(probe.get("tx"))
+            if not address:
+                print(f"\n  ! {label}: FINALIZED, but the record did not expose a contract address.")
+                if explorer:
+                    print(f"    copy the 'Created contract' address from {explorer}/tx/{tx_id} and resume:")
+                    print(f"      python scripts/deploy_contracts.py --network {args.network} "
+                          f"--registry-address 0x<THE ADDRESS THE EXPLORER SHOWS> --write-env")
+                return EXIT_NO_ADDRESS, probe
+            probe["address"] = address
+        return EXIT_OK, probe
+    if state in (STATUS_PENDING, STATUS_PROCESSING):
+        detail = probe.get("phase") or probe.get("detail") or "in progress"
+        print(f"\n  ! {label}: still {state} after the {args.finality_timeout:.0f}s wait budget — last state: {detail}")
+        print("    GenLayer finality is not a race: an ACCEPTED transaction waits out the")
+        print("    appeal window before FINALIZED, so this is expected to keep moving.")
+        print("    Nothing was resent. Keep monitoring:")
+        if explorer:
+            print(f"    {explorer}/tx/{tx_id}")
+        print_resume_hint(args, tx_id=tx_id)
+        return EXIT_PROCESSING, probe
+    print(f"\n  ✗ {label}: FAILED — {probe.get('detail') or state}")
+    if explorer:
+        print(f"    {explorer}/tx/{tx_id}")
+    return EXIT_FAILED, probe
+
+
+def follow_envelope_to_finality(client, envelope: str, label: str,
+                                evm_explorer: str, explorer: str, args,
+                                need_address: bool = True,
+                                sender: str = "") -> tuple[int, dict]:
+    """Track an ALREADY-SUBMITTED envelope tx to a conclusion. Read-only:
+    L2 inclusion → consensus txId → consensus finality → deployed address.
+
+    `sender` is the known deployer, used only to enrich the drop diagnostics
+    (balance/nonce) when the envelope is no longer visible.
+    """
+    probe = wait_for_envelope(client, envelope, label, args.tx_timeout, sender=sender)
+    state = probe["state"]
+    if state == "MINED":
+        receipt = probe.get("receipt") or {}
+        consensus_address = (client.chain.consensus_main_contract or {}).get("address", "")
+        tx_id = consensus_tx_id_from_receipt(client.w3, receipt, consensus_address)
+        if not tx_id:
+            print(f"\n  ✗ {label}: the EVM tx was mined, but no NewTransaction/CreatedTransaction")
+            print("    event was found in its receipt — the consensus layer never registered")
+            print("    a GenLayer transaction, so no contract was created.")
+            if evm_explorer:
+                print(f"    {evm_explorer}/tx/{envelope}")
+            return EXIT_FAILED, probe
+        print(f"  consensus tx      {tx_id}")
+        if explorer:
+            print(f"  {explorer}/tx/{tx_id}")
+        return finish_consensus(client, tx_id, label + " cons.", explorer, args, need_address)
+    if state == STATUS_FAILED:
+        print(f"\n  ✗ {label}: FAILED at the EVM layer — {probe.get('detail')}")
+        print("    the addTransaction call was rejected by the chain; no consensus")
+        print("    transaction was registered and no contract was created.")
+        for line in envelope_diagnostics(probe):
+            print(f"    {line}")
+        return EXIT_FAILED, probe
+    if state == STATUS_SUPERSEDED:
+        print(f"\n  ✗ {label}: FAILED — {probe.get('detail')}")
+        print("    this transaction can never be mined; nothing was deployed.")
+        for line in envelope_diagnostics(probe):
+            print(f"    {line}")
+        return EXIT_FAILED, probe
+    if state == STATUS_PENDING:
+        print(f"\n  ! {label}: still PENDING after the {args.tx_timeout:.0f}s wait budget —")
+        print("    it is in the L2 mempool, so it is alive and nothing must be resent.")
+        for line in envelope_diagnostics(probe):
+            print(f"    {line}")
+        if evm_explorer:
+            print(f"    {evm_explorer}/tx/{envelope}")
+        print_resume_hint(args, envelope=envelope)
+        return EXIT_PROCESSING, probe
+    # UNKNOWN
+    print(f"\n  ! {label}: UNKNOWN after the {args.tx_timeout:.0f}s wait budget — the envelope is")
+    print("    not in any block and not in this node's mempool. It was most likely dropped,")
+    print("    so nothing was deployed. Check the diagnostics, then decide whether to re-send")
+    print("    a fresh deployment (safe only once the old one is confirmed gone everywhere):")
+    for line in envelope_diagnostics(probe):
+        print(f"    {line}")
+    print(f"    {likely_dropped_cause(probe)}")
+    if evm_explorer:
+        print(f"    {evm_explorer}/tx/{envelope}")
+    return EXIT_UNKNOWN, probe
+
+
 def raise_receipt_timeout(client, seconds: int) -> None:
     """Give the underlying web3 receipt wait more than its 120 s default.
 
@@ -303,22 +768,33 @@ def raise_receipt_timeout(client, seconds: int) -> None:
     setattr(eth, "_holding_timeout_patched", True)
 
 
-def report_deploy_failure(label: str, error, explorer: str) -> None:
+def report_deploy_failure(label: str, error, explorer: str, evm_explorer: str = "") -> None:
     print(f"\n{label} did not return cleanly: {error}")
     tx = extract_tx_hash(error)
     if tx:
-        print(f"  transaction submitted: {tx}")
-        if explorer:
-            print(f"  {explorer}/tx/{tx}")
+        print(f"  transaction submitted: {tx} (EVM envelope hash)")
+        if evm_explorer:
+            print(f"  {evm_explorer}/tx/{tx}   <- the EVM layer (this hash)")
+        if explorer and explorer != evm_explorer:
+            print(f"  {explorer}/tx/<consensus txId>   <- the consensus layer (different hash)")
         print("  it may still be processing — check the explorer above.")
+        print("  track it read-only (nothing is resent):")
+        print(f"      python scripts/check_deploy_tx.py {tx} --watch")
         print("  if it finalised, resume without redeploying:")
+        print(f"      --registry-tx {tx}")
         print("      --registry-address 0x<THE ADDRESS THE EXPLORER SHOWS>")
     else:
         print("  no transaction hash was returned, so nothing was submitted.")
 
 
-def write_and_wait(client, registry_address: str, function: str, args: list, label: str, account=None) -> bool:
-    """Send an owner-only write, wait for FINALIZED, and confirm it took."""
+def write_and_wait(client, registry_address: str, function: str, args: list, label: str, account=None,
+                   sent: dict | None = None, explorer: str = "", evm_explorer: str = "", args_cli=None) -> int:
+    """Send an owner-only write and track it to FINALIZED (status-aware).
+
+    Returns an exit code: 0 FINALIZED · 1 FAILED · 2 UNKNOWN · 3 still
+    PENDING/PROCESSING. A submitted transaction is tracked read-only — this
+    function never resends it.
+    """
     print(f"{function:<22}", end="", flush=True)
     fees = fee_kwargs(
         client,
@@ -328,16 +804,29 @@ def write_and_wait(client, registry_address: str, function: str, args: list, lab
         args=args,
         account=account,
     )
-    tx = client.write_contract(
-        address=registry_address, function_name=function, args=args, account=account, **fees
-    )
-    receipt = wait_for_finality(client, tx)
-    status_name = status_name_of(receipt)
-    print(f"{tx[:18]}…  {status_name or 'finalized'}")
-    if status_name and status_name != "FINALIZED":
-        print(f"  ! {label} did not finalize (status {status_name}); finish it by hand")
-        return False
-    return True
+    try:
+        tx = client.write_contract(
+            address=registry_address, function_name=function, args=args, account=account, **fees
+        )
+    except Exception as error:  # noqa: BLE001 - the tx hash is inside the message
+        envelope = extract_tx_hash(error) or (sent or {}).get("envelope")
+        if not envelope:
+            print(f"  (failed: {str(error).splitlines()[0][:100]})")
+            return EXIT_FAILED
+        print(f"  (SDK receipt wait timed out — tracking {envelope[:18]}… read-only)")
+        code = follow_envelope_to_finality(
+            client, envelope, label, evm_explorer, explorer, args_cli,
+            need_address=False, sender=getattr(account, "address", ""),
+        )[0]
+        if sent is not None:
+            sent["envelope"] = ""
+        print(f"{label:<22}  (tracked the submitted tx; state above)")
+        return code
+    if sent is not None:
+        sent["envelope"] = ""  # consumed: this envelope is now being tracked below
+    code, probe = finish_consensus(client, tx, label, explorer, args_cli, need_address=False)
+    print(f"{tx[:18]}…  {probe.get('state') or 'finalized'}")
+    return code
 
 
 def confirm_source(client, registry_address: str, address: str) -> bool:
@@ -393,13 +882,19 @@ def fee_aware_selector_is_live(client) -> bool:
         return False
 
 
-def inject_estimate_gas(client, gas_limit: int) -> None:
+def inject_estimate_gas(client, gas_limit: int, sent: dict | None = None) -> None:
     """Give eth_estimateGas an explicit gas limit.
 
     genlayer-py builds the call with no `gas` field, so the node applies its own
     default cap. A GenLayer deploy carries the whole contract source in
     calldata (~29 kB for HoldingRegistry); under the default cap that runs out
     of gas and surfaces as a bare `execution reverted` with no revert data.
+
+    When `sent` is a dict, the hash of every eth_sendRawTransaction result is
+    also captured in it (key "envelope", last one wins) — that is the EVM
+    envelope hash, which lets the post-submission tracker resume from the
+    exact transaction the SDK sent even when the SDK's own receipt wait times
+    out and its error message is unhelpful.
     """
     provider = client.provider
     original = provider.make_request
@@ -416,7 +911,14 @@ def inject_estimate_gas(client, gas_limit: int) -> None:
                 args = (args[0], [tx] + rest) + tuple(args[2:])
             else:
                 kwargs["params"] = [tx] + rest
-        return original(*args, **kwargs)
+        result = original(*args, **kwargs)
+        if sent is not None and method == "eth_sendRawTransaction" and isinstance(result, dict):
+            hash_value = result.get("result")
+            if isinstance(hash_value, (str, bytes)):
+                sent["envelope"] = (
+                    "0x" + bytes(hash_value).hex() if isinstance(hash_value, bytes) else str(hash_value)
+                )
+        return result
 
     provider.make_request = patched
 
@@ -530,9 +1032,22 @@ def main(argv: list[str] | None = None) -> int:
         help="skip the registry deploy and use this one (resume a partial deploy)",
     )
     parser.add_argument(
+        "--registry-tx",
+        default=os.getenv("HOLDING_REGISTRY_TX", ""),
+        help="EVM envelope hash of an already-submitted registry deploy: track it "
+             "to finality (read-only, never resends) and continue from the address "
+             "it deployed, instead of deploying a new registry",
+    )
+    parser.add_argument(
         "--adjudicator-address",
         default=os.getenv("HOLDING_ADJUDICATOR_ADDRESS", ""),
         help="skip the adjudicator deploy and use this one (resume a partial deploy)",
+    )
+    parser.add_argument(
+        "--adjudicator-tx",
+        default=os.getenv("HOLDING_ADJUDICATOR_TX", ""),
+        help="EVM envelope hash of an already-submitted adjudicator deploy: track it "
+             "to finality (read-only, never resends) instead of deploying a new one",
     )
     parser.add_argument(
         "--attestor",
@@ -586,7 +1101,10 @@ def main(argv: list[str] | None = None) -> int:
         "--tx-timeout",
         type=int,
         default=int(os.getenv("HOLDING_TX_TIMEOUT", "600")),
-        help="seconds to wait for the raw transaction receipt (default 600)",
+        help="seconds to wait for the EVM envelope receipt (L2 inclusion, default "
+             "600). On timeout the submitted transaction is still tracked "
+             "read-only with status-aware polling (PENDING/PROCESSING/FAILED/"
+             "UNKNOWN); nothing is resent",
     )
     args = parser.parse_args(argv)
     load_env()
@@ -653,7 +1171,8 @@ def main(argv: list[str] | None = None) -> int:
     FINALITY_TIMEOUT_S = args.finality_timeout
     if FEE_MODE == "auto":
         FEE_MODE = args.fees
-    inject_estimate_gas(client, args.estimate_gas)
+    sent: dict = {}
+    inject_estimate_gas(client, args.estimate_gas, sent)
     raise_receipt_timeout(client, args.tx_timeout)
 
     if args.diagnose:
@@ -661,17 +1180,34 @@ def main(argv: list[str] | None = None) -> int:
 
     owner = args.owner or account.address
     explorer = EXPLORERS.get(chain_name, "")
+    evm_explorer = EVM_EXPLORERS.get(chain_name, "")
 
     print(f"deploying to {chain_name} from {account.address}")
     print(f"registry owner: {owner}\n")
 
     registry_address = (args.registry_address or "").strip()
+    registry_tx_resume = (args.registry_tx or "").strip()
     if registry_address:
         # 1 · resume — the registry already exists, so only the adjudicator is left
         print(f"using registry        {registry_address} (--registry-address, not deploying)")
         if not confirm_source(client, registry_address, account.address):
             pass  # a read that fails here is not fatal; registration below will tell us
         print()
+    elif registry_tx_resume:
+        # 1 · resume — the registry deploy was already SUBMITTED; track the
+        # existing transaction to finality. Read-only: nothing is resent.
+        print(f"resuming registry deploy from submitted envelope {registry_tx_resume}")
+        print("  (tracking an already-submitted transaction — nothing is resent)")
+        if evm_explorer:
+            print(f"  {evm_explorer}/tx/{registry_tx_resume}")
+        code, probe = follow_envelope_to_finality(
+            client, registry_tx_resume, "registry deploy", evm_explorer, explorer, args,
+            sender=account.address,
+        )
+        if code != EXIT_OK:
+            return code
+        registry_address = probe.get("address", "")
+        print(f"\nregistry address      {registry_address}\n")
     else:
         # 1 · registry
         registry_fees = fee_kwargs(client, "registry deploy")
@@ -680,24 +1216,61 @@ def main(argv: list[str] | None = None) -> int:
                 code=registry_code, args=[owner], account=account, **registry_fees
             )
         except Exception as error:  # noqa: BLE001 - the tx hash is inside the message
-            report_deploy_failure("registry deploy", error, explorer)
-            return 1
-        print(f"registry deploy tx    {registry_tx}")
-        if explorer:
-            print(f"  {explorer}/tx/{registry_tx}")
-
-        registry_receipt = wait_for_finality(client, registry_tx)
-        registry_address = contract_address(registry_receipt)
-        if not registry_address:
-            print("\nThe receipt did not expose a contract address.")
-            print("Open the explorer link above and copy the 'Created contract' address,")
-            print("then pass it back with --registry-address to deploy the adjudicator.")
-            return 1
-        print(f"registry address      {registry_address}\n")
+            # The SDK's internal receipt wait (a blind eth_getTransactionReceipt
+            # poll) gave up, but eth_sendRawTransaction already succeeded — the
+            # transaction is submitted and may still be alive. Keep tracking it
+            # read-only with status-aware polling before declaring anything.
+            envelope = extract_tx_hash(error) or sent.get("envelope")
+            if not envelope:
+                report_deploy_failure("registry deploy", error, explorer, evm_explorer)
+                return EXIT_FAILED
+            print(f"\n  ! {str(error).splitlines()[0]}")
+            print(f"  the transaction WAS submitted — tracking it read-only (nothing is resent): {envelope}")
+            if evm_explorer:
+                print(f"  {evm_explorer}/tx/{envelope}")
+            code, probe = follow_envelope_to_finality(
+                client, envelope, "registry deploy", evm_explorer, explorer, args,
+                sender=account.address,
+            )
+            sent["envelope"] = ""
+            if code != EXIT_OK:
+                return code
+            registry_address = probe.get("address", "")
+            print(f"\nregistry address      {registry_address}\n")
+        else:
+            sent["envelope"] = ""  # consumed: this envelope is now being tracked below
+            print(f"registry deploy tx    {registry_tx}")
+            if explorer:
+                print(f"  {explorer}/tx/{registry_tx}")
+            # The SDK already waited for the EVM envelope receipt. What remains
+            # is the GenLayer consensus lifecycle — now with status-aware
+            # polling that prints PENDING / PROCESSING / FINALIZED / FAILED.
+            code, probe = finish_consensus(
+                client, registry_tx, "registry cons.", explorer, args
+            )
+            if code != EXIT_OK:
+                return code
+            registry_address = probe.get("address", "")
+            print(f"registry address      {registry_address}\n")
 
     adjudicator_address = (args.adjudicator_address or "").strip()
+    adjudicator_tx_resume = (args.adjudicator_tx or "").strip()
     if adjudicator_address:
         print(f"using adjudicator    {adjudicator_address} (--adjudicator-address, not deploying)\n")
+    elif adjudicator_tx_resume:
+        # 2 · resume — the adjudicator deploy was already SUBMITTED; track it.
+        print(f"resuming adjudicator deploy from submitted envelope {adjudicator_tx_resume}")
+        print("  (tracking an already-submitted transaction — nothing is resent)")
+        if evm_explorer:
+            print(f"  {evm_explorer}/tx/{adjudicator_tx_resume}")
+        code, probe = follow_envelope_to_finality(
+            client, adjudicator_tx_resume, "adjudicator deploy", evm_explorer, explorer, args,
+            sender=account.address,
+        )
+        if code != EXIT_OK:
+            return code
+        adjudicator_address = probe.get("address", "")
+        print(f"\nadjudicator address   {adjudicator_address or '(see explorer)'}")
     elif adjudicator_code:
         # 2 · adjudicator — same fee note as above
         adjudicator_fees = fee_kwargs(client, "adjudicator deploy")
@@ -709,26 +1282,64 @@ def main(argv: list[str] | None = None) -> int:
                 **adjudicator_fees,
             )
         except Exception as error:  # noqa: BLE001 - the tx hash is inside the message
-            report_deploy_failure("adjudicator deploy", error, explorer)
-            return 1
-        print(f"adjudicator deploy tx {adjudicator_tx}")
-        if explorer:
-            print(f"  {explorer}/tx/{adjudicator_tx}")
-        adjudicator_receipt = wait_for_finality(client, adjudicator_tx)
-        adjudicator_address = contract_address(adjudicator_receipt)
-        print(f"adjudicator address   {adjudicator_address or '(see explorer)'}")
+            envelope = extract_tx_hash(error) or sent.get("envelope")
+            if not envelope:
+                report_deploy_failure("adjudicator deploy", error, explorer, evm_explorer)
+                return EXIT_FAILED
+            print(f"\n  ! {str(error).splitlines()[0]}")
+            print(f"  the transaction WAS submitted — tracking it read-only (nothing is resent): {envelope}")
+            if evm_explorer:
+                print(f"  {evm_explorer}/tx/{envelope}")
+            code, probe = follow_envelope_to_finality(
+                client, envelope, "adjudicator deploy", evm_explorer, explorer, args,
+                sender=account.address,
+            )
+            sent["envelope"] = ""
+            if code != EXIT_OK:
+                return code
+            adjudicator_address = probe.get("address", "")
+            print(f"\nadjudicator address   {adjudicator_address or '(see explorer)'}")
+        else:
+            sent["envelope"] = ""  # consumed: this envelope is now being tracked below
+            print(f"adjudicator deploy tx {adjudicator_tx}")
+            if explorer:
+                print(f"  {explorer}/tx/{adjudicator_tx}")
+            code, probe = finish_consensus(
+                client, adjudicator_tx, "adjudicator cons.", explorer, args
+            )
+            if code != EXIT_OK:
+                return code
+            adjudicator_address = probe.get("address", "")
+            print(f"adjudicator address   {adjudicator_address or '(see explorer)'}")
 
     # 3 · register — the deployer is the owner, so it can add the source and
     #     the attestor. Without this the contracts exist but nothing may emit.
     attestor = (args.attestor or "").strip() or account.address
+    worst_code = EXIT_OK
     if not args.no_register:
         print("\nregistering on the registry contract")
         try:
             if adjudicator_address:
-                write_and_wait(client, registry_address, "register_source", [adjudicator_address, True], "register_source", account)
-                print(f"  source registered   {confirm_source(client, registry_address, adjudicator_address)}")
-            write_and_wait(client, registry_address, "register_attestor", [attestor, True], "register_attestor", account)
-            print(f"  attestor            {attestor}")
+                code = write_and_wait(
+                    client, registry_address, "register_source", [adjudicator_address, True],
+                    "register_source", account,
+                    sent=sent, explorer=explorer, evm_explorer=evm_explorer, args_cli=args,
+                )
+                worst_code = max(worst_code, code)
+                if code == EXIT_OK:
+                    print(f"  source registered   {confirm_source(client, registry_address, adjudicator_address)}")
+                elif code in (EXIT_PROCESSING, EXIT_UNKNOWN):
+                    print("  (register_source not confirmed yet — resume with the command printed above)")
+            code = write_and_wait(
+                client, registry_address, "register_attestor", [attestor, True],
+                "register_attestor", account,
+                sent=sent, explorer=explorer, evm_explorer=evm_explorer, args_cli=args,
+            )
+            worst_code = max(worst_code, code)
+            if code == EXIT_OK:
+                print(f"  attestor            {attestor}")
+            elif code in (EXIT_PROCESSING, EXIT_UNKNOWN):
+                print("  (register_attestor not confirmed yet — resume with the command printed above)")
         except FeeEstimationUnavailable as error:
             print(f"\n  ! registration skipped: {error}")
             print("    The contracts are deployed; this step only needs the fee estimator to")
@@ -741,6 +1352,11 @@ def main(argv: list[str] | None = None) -> int:
         print("\nskipped registration (--no-register):")
         print("  register_source(<adjudicator>, True) and register_attestor(<you>, True)")
         print("  are still required before any holding can be created.")
+    if worst_code != EXIT_OK:
+        # Something was submitted but is not confirmed yet (or failed). Stop
+        # with the precise state instead of pretending success; the commands
+        # above resume it without redeploying anything.
+        return worst_code
 
     env_block = f"""
 # HOLDING — deployed {chain_name}

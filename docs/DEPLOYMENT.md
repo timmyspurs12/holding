@@ -372,6 +372,7 @@ dies, the site is unaffected.
 | Signature rejected after a domain change | the nonce is bound to `HOLDING_PUBLIC_ORIGIN`; set it and sign again |
 | Wallet asks to switch network and will not | chain id from `/auth/config` is not in the wallet — accept the add-network prompt, or check `GENLAYER_CHAIN_ID` |
 | Live writes rejected by the node | v0.6 fee fields — see Phase 4 step 2 |
+| `Transaction HexBytes('0x…') is not in the chain after 600 seconds` | the EVM envelope (addTransaction) never got an L2 receipt — see "Live deployment (2026-09-12)" below. Track it with `scripts/check_deploy_tx.py 0x… --watch`; resume with `--registry-tx 0x…` |
 
 ---
 
@@ -468,3 +469,120 @@ mismatch described above.
   activity via a single `eth_getLogs` call (~20 s), and states in its own output
   that it cannot measure a failure rate.
 - `scripts/probe_revert.py` prints the raw revert payload for a deploy.
+
+---
+
+## Live deployment (2026-09-12): "not in the chain after 600 seconds"
+
+### What the 600 seconds actually wait for
+
+A GenLayer write has **two layers**, and the script's error came from the
+first one, not from GenLayer consensus:
+
+1. **L2 (EVM) envelope** — genlayer-py signs an EIP-1559 transaction that
+   calls `addTransaction` on the consensus contract
+   (`0x0112Bf6e…271D` on Bradbury, a ZKsync-based chain) and submits it with
+   `eth_sendRawTransaction`. Its return value — the *envelope hash* — is what
+   `eth_sendRawTransaction` gives back, and it is the hash in the error
+   message. Inside the SDK, `deploy_contract` then waits for the envelope's
+   EVM receipt: a blind `eth_getTransactionReceipt` poll with
+   `timeout = --tx-timeout` (600 s). If no receipt appears, web3 raises
+   `TimeExhausted: Transaction HexBytes('0x…') is not in the chain after 600
+   seconds`. **That is the whole 600-second window** — it is L2 inclusion,
+   nothing else.
+2. **Consensus** — only once the envelope is mined does the consensus
+   contract register a GenLayer transaction (a *different* hash, emitted in
+   the `NewTransaction` / `CreatedTransaction` log), which then walks
+   Pending → Proposing → Committing → Revealing → Accepted → Finalized
+   (or Canceled / timeout). Finality is when the appeal window closes; an
+   ACCEPTED transaction can wait there for a while. `client.wait_for_
+   transaction_receipt(wait_until="finalized")` polls this layer only.
+
+Consequences that cost real time:
+
+- The hash in the error message (and in the explorer link the old script
+  printed) is the **envelope hash**. The GenLayer explorer
+  (`explorer-bradbury.genlayer.com/tx/…`) is keyed by the **consensus txId**,
+  so it answers "Transaction details unavailable" for an envelope hash even
+  when the transaction is perfectly healthy. The envelope hash belongs in
+  the EVM-layer explorer
+  (`zksync-os-testnet-genlayer.explorer.zksync.dev/tx/…`).
+- If the envelope never gets a receipt (dropped from the mempool — e.g. the
+  SDK's `maxFeePerGas = baseFee + 2 gwei` below the sequencer's current gas
+  price, or a balance/nonce problem), nothing on the consensus layer ever
+  happens, and no contract is created. A 600-second L2-inclusion window is
+  already generous; "not in the chain" after that means *dropped*, not
+  *slow*.
+
+### What the current state of a submitted hash can be
+
+`scripts/check_deploy_tx.py` classifies it (read-only, no key needed):
+
+| state | meaning | what to do |
+|---|---|---|
+| PENDING | in the L2 mempool, not in a block | `--watch`; do **not** resend |
+| MINED → PROCESSING | envelope in a block; consensus lifecycle moving (incl. ACCEPTED in its appeal window) | wait; finality is not a race |
+| FINALIZED | consensus Finalized **and** execution `FINISHED_WITH_RETURN` | take the deployed address, resume |
+| FAILED | EVM revert (receipt status 0), consensus Canceled, or a non-accepted decision | nothing was deployed; a fresh deploy is the only path |
+| UNKNOWN | not in any block and not in the node's mempool | most likely dropped — see the printed gas/balance/nonce diagnostics before deciding anything |
+| SUPERSEDED | the envelope's nonce slot was already used by another tx | can never mine; nothing was deployed |
+
+```bash
+pip install "web3>=7"          # the checker needs only web3, no genlayer-py
+python scripts/check_deploy_tx.py 0xENVELOPE_HASH          # one-shot
+python scripts/check_deploy_tx.py 0xENVELOPE_HASH --watch  # until terminal state
+python scripts/check_deploy_tx.py --consensus-tx 0x… --watch
+
+# with the deployer address (no key needed) the drop diagnostics also cover
+# the account's balance and nonce, so an UNKNOWN result can be pinned to a
+# cause (unfunded / fee-starved / queued) rather than left as "not propagated"
+python scripts/check_deploy_tx.py 0xENVELOPE_HASH --sender 0xDEPLOYER
+```
+
+Exit codes: 0 FINALIZED · 1 FAILED · 2 UNKNOWN · 3 PENDING/PROCESSING ·
+4 finalized but no address exposed.
+
+### Resuming without redeploying
+
+The deploy script never resends a transaction that was already submitted.
+When its own wait times out it keeps tracking the same envelope read-only,
+prints the state (PENDING / PROCESSING / FINALIZED / FAILED / UNKNOWN) and
+exits with the code above. To pick it up in a later run:
+
+```bash
+# track the submitted envelope to finality, then continue (adjudicator, registration)
+python scripts/deploy_contracts.py --network bradbury --registry-tx 0xENVELOPE_HASH --write-env
+
+# or, once you have the deployed address (explorer / checker output)
+python scripts/deploy_contracts.py --network bradbury --registry-address 0xADDRESS --write-env
+```
+
+`--adjudicator-tx` works the same way for the adjudicator deploy.
+
+### Where the deployed address lives
+
+**Not** in the EVM envelope receipt's `contractAddress` (that is null — the
+envelope calls a contract, it is not a CREATE). The created contract address
+is a **consensus-layer** value: the stored `recipient` field of the consensus
+transaction record (zero while pending, the created address after the GenVM
+executes the deploy). genlayer-py surfaces it as `data.contract_address` on
+`get_transaction()` / `wait_for_transaction_receipt()`, and the explorer
+shows it as the deploy's "Created contract". The script reads it from the
+consensus record and falls back to telling you where to copy it from.
+
+### Improvements shipped with this diagnosis
+
+- Status-aware polling on **both** layers with periodic state printing
+  (`PENDING / PROCESSING / FINALIZED / FAILED`, plus `UNKNOWN` and
+  `SUPERSEDED` for the EVM layer) instead of one blind 600-second wait.
+- The envelope hash is captured at `eth_sendRawTransaction` time, so the
+  tracker resumes from the exact submitted transaction even when the SDK's
+  error message is unhelpful.
+- `--registry-tx` / `--adjudicator-tx` resume from an already-submitted
+  envelope (read-only tracking — nothing is ever resent).
+- `scripts/check_deploy_tx.py` — standalone read-only checker (pure web3,
+  no private key, no genlayer-py) for any submitted hash.
+- Distinguishable exit codes (0/1/2/3/4) so a timeout while
+  PENDING/PROCESSING is not confused with a failure.
+- Failure output now points the envelope hash at the EVM-layer explorer and
+  the consensus txId at the GenLayer explorer.
