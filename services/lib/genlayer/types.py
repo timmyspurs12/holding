@@ -33,6 +33,8 @@ NETWORK_LABELS = {
     "demo": (NetworkMode.DEMO, ""),
     "localnet": (NetworkMode.DEMO, "localnet"),
     "studionet": (NetworkMode.TESTNET, "studionet"),
+    "studio_devnet": (NetworkMode.TESTNET, "studio_devnet"),
+    "studio-dev": (NetworkMode.TESTNET, "studio_devnet"),
     "testnet_asimov": (NetworkMode.TESTNET, "testnet_asimov"),
     "asimov": (NetworkMode.TESTNET, "testnet_asimov"),
     "bradbury": (NetworkMode.TESTNET, "testnet_bradbury"),

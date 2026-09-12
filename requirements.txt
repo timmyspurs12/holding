@@ -1,14 +1,31 @@
-# Reporter API, indexer and demo runner.
-fastapi==0.115.6
-uvicorn[standard]==0.34.0
-pydantic==2.10.4
-python-dotenv==1.0.1
+# HOLDING — Reporter API, indexer, demo runner and tests.
+#
+# Tested on CPython 3.11 / 3.12 / 3.13. On 3.14+ use pydantic >= 2.12 (below
+# that, pydantic-core has no cp314 wheel and pip will try to build it from
+# Rust, which needs Visual Studio C++ build tools on Windows).
+#
+# Windows users who hit a wheel error should do the relaxed install:
+#   python -m pip install --upgrade pip
+#   python -m pip install "pydantic>=2.12" "fastapi>=0.115" "uvicorn>=0.34" \
+#                         "httpx>=0.27" "pytest>=8" "python-dotenv"
+
+fastapi>=0.115,<1
+# plain `uvicorn` on purpose: the [standard] extras pull uvloop/httptools,
+# which do not build cleanly on Windows or on brand-new Python versions.
+uvicorn>=0.34
+pydantic>=2.12,<3
+python-dotenv>=1.0
+
+# Wallet sign-in: ECDSA recovery for `personal_sign` sessions. Imported lazily,
+# so a machine without it still runs the API, the demo loop and the tests — it
+# just reports wallet sign-in as unavailable instead of failing at startup.
+eth-account>=0.10
 
 # Tests
-pytest==8.3.4
-httpx==0.28.1
+pytest>=8
+httpx>=0.27
 
-# Live GenLayer access (only needed when GENLAYER_NETWORK is not `demo`).
-# Pinned to the current stable release; the consensus-v0.6 fee API is only in
-# the 0.19 release candidate, so the adapter does not use it.
-genlayer-py==0.18.0
+# Live GenLayer access is OPTIONAL and only needed when GENLAYER_NETWORK is
+# not `demo`. Install it separately so DEMO mode and the test suite stay
+# installable on any platform:
+#   pip install -r requirements-live.txt

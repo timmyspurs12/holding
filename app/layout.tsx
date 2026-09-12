@@ -4,6 +4,8 @@ import { GeistSans } from "geist/font/sans";
 import "./globals.css";
 import { Nav } from "@/lib/components/site/Nav";
 import { Footer } from "@/lib/components/site/Footer";
+import { getCorpus } from "@/lib/data/live";
+import { WalletProvider } from "@/lib/wallet/WalletProvider";
 
 const display = Instrument_Serif({
   subsets: ["latin"],
@@ -28,7 +30,11 @@ export const metadata: Metadata = {
     "HOLDING turns finalized GenLayer decisions into searchable, citable authority for the decisions that come next.",
 };
 
-export default function RootLayout({ children }: { children: React.ReactNode }) {
+export default async function RootLayout({ children }: { children: React.ReactNode }) {
+  const { network, live } = await getCorpus();
+  const simulated = network?.simulated ?? true;
+  const mode = network?.mode ?? "DEMO";
+
   return (
     <html lang="en" className={`${GeistSans.variable} ${display.variable} ${mono.variable}`}>
       <body className="min-h-screen bg-obsidian font-sans antialiased">
@@ -36,17 +42,19 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
           <div className="shell flex h-[26px] items-center justify-between">
             <p className="font-mono text-[9px] uppercase tracking-[0.18em] text-muted">
               <span className="mr-2 inline-block h-[4px] w-[4px] translate-y-[-1px] rounded-full bg-copper align-middle" />
-              Demo environment · simulated records
+              {simulated ? "Demo environment · simulated records" : `${mode} · live contract records`}
             </p>
             <p className="hidden font-mono text-[9px] uppercase tracking-[0.18em] text-muted sm:block">
-              GenLayer testnet · precedent index v0.1
+              {live ? `GenLayer ${network?.network ?? mode}` : "GenLayer · not connected"} · precedent index v0.1
             </p>
           </div>
         </div>
 
-        <Nav />
-        <main>{children}</main>
-        <Footer />
+        <WalletProvider>
+          <Nav network={network} />
+          <main>{children}</main>
+          <Footer />
+        </WalletProvider>
       </body>
     </html>
   );

@@ -11,10 +11,27 @@ then — point everything at a live GenLayer network.
 git clone https://github.com/<USERNAME>/holding.git holding-check && cd holding-check
 
 python -m venv .venv && source .venv/bin/activate      # Windows: .venv\Scripts\activate
+python -m pip install --upgrade pip
 pip install -r requirements.txt
+```
+
+**Python version.** CPython 3.11–3.13 is recommended. Python 3.14 works, but only
+with `pydantic >= 2.12` — older pydantic has no cp314 wheel, so pip falls back to
+compiling `pydantic-core` from Rust and fails without Visual Studio C++ build
+tools. If you see `Failed building wheel for pydantic-core`, either install
+Python 3.12, or install the deps unpinned:
+
+```bash
+pip install "pydantic>=2.12" "fastapi>=0.115" "uvicorn>=0.34" \
+            "httpx>=0.27" "pytest>=8" "python-dotenv"
+```
+
+`genlayer-py` is deliberately kept out of `requirements.txt` (it is only needed for
+live networks and pulls heavy web3 dependencies). Install it with
+`pip install -r requirements-live.txt` when you reach Phase 4.
 
 python scripts/render_contract.py --check   # generated contract is current
-pytest tests/ -q                            # 127 passed
+python -m pytest tests/ -q                  # 127 passed
 GENLAYER_NETWORK=demo python scripts/demo_loop.py
 ```
 
@@ -55,6 +72,18 @@ Checks:
 
 Then `npm run build` (must print `✓ Generating static pages (36/36)`).
 
+Finally, the one-command gate — the same script you will run against production:
+
+```bash
+python scripts/smoke_test.py --base-url http://127.0.0.1:8000 \
+                             --admin-token dev-admin-token --expect-mode DEMO
+# 27/27 checks passed
+```
+
+It asserts every route responds, that search returns only `FINAL` holdings, that
+every holding carries provenance and authority components, and that admin writes
+are refused on authorization *before* the payload is validated.
+
 ---
 
 ## Phase 2 — deploy the Reporter API
@@ -67,6 +96,14 @@ Any host that runs a container or a Python process. The repo ships a `Dockerfile
 docker build -t holding-reporter .
 docker run -p 8000:8000 --env-file .env holding-reporter
 curl localhost:8000/health
+```
+
+**Verify any deployment** (local Docker, Railway, Render, Fly) with:
+
+```bash
+python scripts/smoke_test.py --base-url https://YOUR-API-HOST \
+                             --admin-token "$HOLDING_ADMIN_TOKEN" --expect-mode DEMO
+# add --expect-mode TESTNET once Phase 4 is live; the script fails on a mode mismatch
 ```
 
 ### Railway
@@ -113,15 +150,31 @@ fly deploy
 ```bash
 npm i -g vercel
 vercel link
-vercel env add HOLDING_API_URL production     # https://<your-api-host>
+vercel env add HOLDING_API_URL production     # https://YOUR-API-HOST
 vercel --prod
 ```
 
 Or in the Vercel dashboard: Framework **Next.js**, root `.`, build `npm run build`,
-env `HOLDING_API_URL=https://<your-api-host>` (and `NEXT_PUBLIC_HOLDING_API_URL` if
-you ever call the API from the browser).
+env `HOLDING_API_URL=https://YOUR-API-HOST`.
 
-Post-deploy check: open `https://<site>/holdings`. Live rows appear first and the
+Leave `NEXT_PUBLIC_HOLDING_API_URL` unset. The browser calls `/api/reporter/*` on
+the site's own origin and Next proxies it to `HOLDING_API_URL`, so there is no
+CORS to configure and no API address in the page. Set it only if the API lives on
+another origin — and then add that origin to the API's `CORS_ORIGINS`.
+
+If you do host them apart, also set on the **API**:
+
+```
+HOLDING_PUBLIC_ORIGIN=https://YOUR-SITE     # stamped into the wallet sign-in message
+HOLDING_SESSION_SECRET=<random>               # sessions survive an admin-token rotation
+HOLDING_OPERATOR_ADDRESSES=0x…,0x…            # wallets that count as operators
+```
+
+Without `HOLDING_PUBLIC_ORIGIN` the signed message shows the API's own host, which
+works but reads badly. Without a session secret, rotating `HOLDING_ADMIN_TOKEN`
+logs every wallet out.
+
+Post-deploy check: open `https://YOUR-SITE/holdings`. Live rows appear first and the
 network tag reads `DEMO` until Phase 4. If the API is unreachable the site falls back
 to its labelled demo corpus instead of breaking — verify that by temporarily pointing
 `HOLDING_API_URL` at a dead host.
@@ -142,26 +195,76 @@ dies, the site is unaffected.
 
 1. **Fund an operator account** — faucet: https://testnet-faucet.genlayer.foundation
 
-2. **Move to the fee-capable SDK.** Consensus v0.6 requires fee fields on every
-   deploy and write; those exist in `genlayer-py` **0.19 RC**, not the pinned 0.18.0.
+2. **Install the fee-capable SDK.** Consensus v0.6 requires a fee payload on
+   every deploy and write. Those fields exist in `genlayer-py` **0.19.0rc2** and
+   later — not in 0.18.0.
 
    ```bash
-   pip install "genlayer-py==0.19.0rc*"          # pin the exact RC you test against
-   # then thread FeesDistribution/feeValue through services/lib/genlayer/live.py :: write()
+   pip install -r requirements-live.txt
    ```
 
-   Until that is done, live writes will be rejected by the node. This is the one
-   blocker for a live deployment and it is isolated to a single file.
+   You do **not** have to write any fee code. The fee payload is already wired
+   up: `services/lib/genlayer/live.py` detects whether the installed SDK accepts
+   a `fees` argument (by inspecting the signature, not by version sniffing),
+   estimates the fee for each specific call, and attaches it. On 0.18 and
+   earlier it sends the call unchanged.
 
-3. **Deploy the contract** (GenLayer Studio, or the CLI):
+   Escape hatches:
 
    ```bash
-   genlayer deploy contracts/HoldingRegistry.py --network bradbury
-   genlayer deploy contracts/Adjudicator.py --network bradbury --args <registry_address> digital-commerce RefundArbiter 5
+   HOLDING_FEE_ESTIMATE=off       # never attach fees
+   HOLDING_FEE_ESTIMATE=auto      # default: estimate, and send anyway if it fails
    ```
 
-   Record both addresses. Confirm on the explorer:
-   https://explorer-bradbury.genlayer.com
+   If a transaction is rejected for running out of fee budget mid-consensus,
+   top it up with `client.top_up_fees(tx_id, distribution, value)` rather than
+   resubmitting — resubmitting replays the call.
+
+   `pip install "genlayer-py==0.19.0rc*"` does **not** work: pip does not accept
+   a wildcard in a `==` specifier. Use the exact version, as above.
+
+3. **Deploy the contracts.** The repo ships a deployer that does both, in order,
+   waits for real `FINALIZED` receipts, and prints the `.env` block:
+
+   ```bash
+   pip install -r requirements-live.txt
+   export GENLAYER_PRIVATE_KEY="0xPASTE_YOUR_TESTNET_KEY"
+
+   python scripts/deploy_contracts.py --dry-run        # validates files + args, no network
+   python scripts/deploy_contracts.py --network bradbury --write-env
+   ```
+
+   Output you need:
+
+   ```
+   registry address      0x…
+   adjudicator address   0x…
+   --- add to .env ---
+   GENLAYER_NETWORK=bradbury
+   HOLDING_REGISTRY_ADDRESS=0x…
+   ADJUDICATOR_ADDRESS=0x…
+   HOLDING_DEMO_SEED=false
+   ```
+
+   The deployer account becomes the registry **owner** (the only address that can
+   register sources and attestors) unless you pass `--owner 0x…`. If a receipt
+   does not expose the created address, copy it from the explorer link the script
+   prints, then resume without redeploying:
+
+   ```bash
+   python scripts/deploy_contracts.py --network bradbury --registry-address 0xPASTE_REGISTRY_ADDRESS --write-env
+   ```
+
+   Deploying is not the last step. The script then calls
+   `register_source(<adjudicator>, true)` and `register_attestor(your address, true)` and
+   waits for `FINALIZED` receipts, because the registry refuses holdings from
+   unregistered contracts. Pass `--no-register` to skip that, or `--attestor 0x…`
+   to name a different attestor.
+
+   Explorer: https://explorer-bradbury.genlayer.com
+
+   `--dry-run` is safe to run anywhere: it parses both contracts and prints the
+   constructor arguments without touching a network.
 
 4. **Configure the API** and restart:
 
@@ -171,19 +274,30 @@ dies, the site is unaffected.
    GENLAYER_CHAIN_ID=4221
    HOLDING_REGISTRY_ADDRESS=0x…
    ADJUDICATOR_ADDRESS=0x…
-   GENLAYER_PRIVATE_KEY=<operator key>
+   GENLAYER_PRIVATE_KEY="0xPASTE_YOUR_TESTNET_KEY"
    HOLDING_DEMO_SEED=false
    ```
 
    With `GENLAYER_NETWORK` not `demo`, the adapter refuses to start without a
    registry address — it will not silently serve demo data.
 
-5. **Register the writer** (owner only, on-chain):
+5. **Confirm the registration** step 3 performed (owner only, on-chain):
 
    ```
    register_source(<adjudicator address>, true)     # its holdings arrive as PENDING
    register_attestor(<attestor address>, true)      # it may attest finality
    ```
+
+   If you deployed with `--no-register`, do both now:
+
+   ```bash
+   python scripts/deploy_contracts.py --network bradbury \
+     --registry-address 0xPASTE_REGISTRY_ADDRESS --no-adjudicator --attestor 0xPASTE_YOUR_ADDRESS
+   ```
+
+   Until a source is registered, `create_holding` from that contract is rejected
+   with *"registered source contract or owner only"* — that is the corpus-poisoning
+   defence working, not a bug.
 
 6. **Run one real case** and watch the lifecycle:
 
@@ -195,7 +309,7 @@ dies, the site is unaffected.
    `FINISHED_WITH_RETURN`. Status alone is not success.
 
    ```bash
-   curl -X POST https://<api>/admin/holdings/<id>/finality \
+   curl -X POST https://YOUR-API-HOST/admin/holdings/THE-HOLDING-ID/finality \
      -H "X-Admin-Token: $TOKEN" -H "Idempotency-Key: attest-<id>-1" \
      -H "Content-Type: application/json" \
      -d '{"holding_id":"HLD-000001","tx_status_code":7,
@@ -203,12 +317,25 @@ dies, the site is unaffected.
           "finality_timestamp":<unix>,"source_tx":"0x…"}'
    ```
 
-7. **Verify the live path:**
+7. **Verify the live path** with the same gate you used locally:
+
+   ```bash
+   python scripts/smoke_test.py --base-url https://YOUR-API-HOST \
+                                --admin-token "$HOLDING_ADMIN_TOKEN" --expect-mode TESTNET
+   ```
+
 
    * `/health` → `network.mode: TESTNET`, `simulated: false`
    * `/holdings` → only contract records; the site tag flips to `TESTNET`
    * `POST /demo/cases` → `403` unless `HOLDING_ALLOW_SIMULATION=true`
    * `get_precedent` on an empty registry → `[]`, never an error
+   * `/auth/config` → `expected.chain_id` is `4221`, not `0`
+   * `POST /operator/source-contracts` with no session → `401`, not `422`
+
+   Then do it for real: open `/developers`, connect a wallet, propose the
+   adjudicator address you just deployed, and confirm it lands as `PENDING`.
+   Approving it is intentionally not possible from the browser — that needs
+   `HOLDING_ADMIN_TOKEN`.
 
 8. **Mainnet**: repeat with `GENLAYER_NETWORK=mainnet`. `/demo/*` is hard-disabled
    there, and `HOLDING_ALLOW_SIMULATION` is ignored.
@@ -224,6 +351,9 @@ dies, the site is unaffected.
 * [ ] Rate limit tuned; `/health` exempt (used by the platform health check)
 * [ ] Indexer has a persistent volume for `data/indexer.db`
 * [ ] `HOLDING_DEMO_SEED=false` on any network that is not `demo`
+* [ ] `HOLDING_PUBLIC_ORIGIN` set to the site origin (wallet sign-in message)
+* [ ] `HOLDING_SESSION_SECRET` set, so admin-token rotation does not log everyone out
+* [ ] `HOLDING_OPERATOR_ADDRESSES` lists the operator wallets, or is deliberately empty
 * [ ] Alerts on `/health` → `status: degraded` (registry unreachable)
 
 ## If something breaks
@@ -237,4 +367,104 @@ dies, the site is unaffected.
 | `400 Idempotency-Key header is required` | write without a replay key |
 | `429 rate limit exceeded` | lower request rate or raise `RATE_LIMIT_PER_MINUTE` |
 | Site shows only the demo corpus | `HOLDING_API_URL` unset or the API is unreachable — the site falls back deliberately |
+| Connect button does nothing | no injected wallet in this browser. MetaMask/Rabby/Brave inject; WalletConnect and mobile wallets do not |
+| Wallet connects but `/operator/*` returns 401 | session expired (8 h) or `HOLDING_ADMIN_TOKEN` rotated without a `HOLDING_SESSION_SECRET` |
+| Signature rejected after a domain change | the nonce is bound to `HOLDING_PUBLIC_ORIGIN`; set it and sign again |
+| Wallet asks to switch network and will not | chain id from `/auth/config` is not in the wallet — accept the add-network prompt, or check `GENLAYER_CHAIN_ID` |
 | Live writes rejected by the node | v0.6 fee fields — see Phase 4 step 2 |
+
+---
+
+## Live deployment (verified 2026-09-11)
+
+### Root cause: the SDK and the deployed contract speak different ABIs
+
+genlayer-py 0.19 always encodes consensus calls with the v0.6 **fee-bearing**
+entrypoint:
+
+```
+addTransaction((tuple, ...))   selector 0x35a251fb
+```
+
+Bradbury's deployed consensus contract does not implement that function. Calling
+an unknown selector reverts with **empty revert data**, which is why every
+failure looked like a bare `execution reverted` with no reason, no matter what
+was tried.
+
+The same SDK still ships the pre-fee ABI, and forcing it makes the SDK emit:
+
+```
+addTransaction(address,address,uint256,uint256,bytes,uint256)   selector 0xe71d5196
+```
+
+That selector **is** implemented, and transactions using it are succeeding on
+Bradbury right now — the most recent ones sampled all returned `status=1`.
+
+Measured side by side, same network, same moment:
+
+| encoding | selector | result |
+|---|---|---|
+| fee-bearing (0.19 default) | `0x35a251fb` | reverted |
+| pre-fee (legacy ABI) | `0xe71d5196` | accepted |
+
+### The fix
+
+`deploy_contracts.py` now detects this automatically. If the network's fee
+policy call reverts, it swaps in the pre-fee consensus ABI and omits fees (they
+can only travel on the fee-bearing path). You will see:
+
+```
+  ! this network does not implement the v0.6 fee-bearing addTransaction
+    (its fee policy call reverts), so genlayer-py's default encoding would
+    revert with no reason. Switching to the pre-fee consensus ABI.
+```
+
+Control it with `--consensus-abi {auto,fees,legacy}` (env
+`HOLDING_CONSENSUS_ABI`, default `auto`).
+
+Verified end to end: after the switch, the failure changes from
+`execution reverted` to `InvalidTransaction`/`LackOfFundForMaxFee`, which is the
+**balance** check — the transaction shape is accepted. A funded key should
+deploy.
+
+```bash
+cd /c/Users/ADMIN/downloads/holding
+export GENLAYER_PRIVATE_KEY="0xYOUR_TESTNET_KEY"
+python scripts/deploy_contracts.py --network bradbury --write-env
+```
+
+### Supporting evidence
+
+- Bradbury fee manager `0xF205868b…`: `GENPerTimeUnit()` = 0 and
+  `storageUnitPrice()` = 0, but **`quoteGasPrice()` and
+  `messageFeeParamsBudgetFloor()` are absent**, so `get_current_fee_policy()`
+  always reverts. Asimov is identical.
+- Consensus contract bytecode exposes 6 function selectors, none of which is
+  `0x35a251fb`.
+- Deployer balance and nonce are fine (90.99 GEN, nonce 0).
+
+### An earlier claim, retracted
+
+A previous revision of this document said Bradbury was rejecting ~83% of
+consensus transactions and was effectively down. **That was wrong.** It came
+from a 12-transaction sample that did not measure what it looked like it was
+measuring: reverted transactions emit no events, so log-based sampling is
+biased toward successes, and a re-scan of a different window found a completely
+different picture. The network is healthy. The problem was always the ABI
+mismatch described above.
+
+### Improvements made while diagnosing this
+
+- `--consensus-abi auto|fees|legacy` — the fix above.
+- `--finality-timeout` (env `HOLDING_FINALITY_TIMEOUT`, default **600**).
+  genlayer-py's own wait is only 10 polls x 3 s = **30 s**, too short for
+  consensus.
+- Fee estimation is retried (env `HOLDING_FEE_RETRIES`, default 10) instead of
+  degrading to a feeless transaction.
+- `--fees {auto,zero,off}` sends an explicit fee distribution.
+- `--adjudicator-address` resumes a partial deploy without redeploying.
+- `studio_devnet` is selectable as `--network`.
+- `diagnose_network.py` probes the four fee-manager methods, reports consensus
+  activity via a single `eth_getLogs` call (~20 s), and states in its own output
+  that it cannot measure a failure rate.
+- `scripts/probe_revert.py` prints the raw revert payload for a deploy.

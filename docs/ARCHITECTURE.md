@@ -223,7 +223,7 @@ Simulated transaction references are valid hex with a visible marker (`0xdef1…
 missing, the adapter raises `LiveUnavailable` and the API reports the mode; it never
 silently serves demo data in place of a live network.
 
-### Live-mode notes (pinned to genlayer-py 0.18.0)
+### Live-mode notes (fees, consensus v0.6)
 
 * Client: `create_client(chain=…)`, then `read_contract`, `write_contract`,
   `wait_for_transaction_receipt`, `appeal_transaction`.
@@ -258,6 +258,15 @@ Clean, typed JSON. No raw receipts, web3 objects or SDK models leave the adapter
 | `POST /admin/holdings/{id}/reject` | mark ineligible |
 | `POST /admin/citations` | record a relationship |
 | `POST /demo/cases`, `POST /demo/seed` | labelled simulation (never on mainnet) |
+| `GET /auth/config` | what a wallet has to sign, and whether sign-in is on |
+| `GET /auth/nonce?address=` | issue a single-use sign-in nonce + message |
+| `POST /auth/verify` | verify a `personal_sign` signature, open a session |
+| `GET /auth/session` | is this session still valid? |
+| `GET /operator/source-contracts` | source-contract proposals (public) |
+| `POST /operator/source-contracts` | propose a source (needs a wallet session) |
+| `GET /operator/me` | the signed-in address and its proposals |
+| `POST /admin/source-contracts/{id}/approve` | approve → `register_source()` on-chain |
+| `POST /admin/source-contracts/{id}/reject` | decline a proposal |
 
 Every list response carries the `network` block it came from, so a client cannot
 mistake a simulated record for a live one.
@@ -279,6 +288,41 @@ catalogue. An unqualified search only returns `FINAL` holdings.
 * **Secrets** — `.env` only, never logged, never serialised; `GenLayerConfig`
   marks the key and token `repr=False`.
 * **Live writes** — only through the adapter; the API never signs anything itself.
+
+### Wallet sign-in and operator sessions
+
+A registered source contract is the only thing allowed to emit holdings, so who
+gets to add one matters. HOLDING splits that in two:
+
+1. **A wallet proves control of an address.** `GET /auth/nonce` issues a
+   single-use nonce; the wallet signs it with `personal_sign` (off-chain, free,
+   cannot move funds); `POST /auth/verify` recovers the signer and returns an
+   HMAC-signed session token. The message is rebuilt *server-side* from the
+   stored nonce record, so the client's copy of the text is never trusted, and
+   it is bound to one address, one origin and one chain id.
+2. **That address proposes, an operator approves.** `POST /operator/source-contracts`
+   queues a `PENDING` proposal and writes nothing to the registry. Approval —
+   `POST /admin/source-contracts/{id}/approve`, gated by `HOLDING_ADMIN_TOKEN` —
+   is what calls `register_source()` on the contract.
+
+That asymmetry is the corpus-poisoning defence. Signing a message with a wallet
+is cheap; being able to do it must not let anyone add an emitter to the
+canonical registry.
+
+Injected wallets only (EIP-1193: MetaMask, Rabby, Brave, Frame). WalletConnect
+and mobile wallets do not inject, so they are not supported — the UI says so
+instead of failing silently. Reading anything on HOLDING never needs a wallet:
+it is a public record, and the sign-in is not on the path to any read.
+
+| | propose | approve | attest / cite / reject |
+|---|---|---|---|
+| anyone | — | — | — |
+| wallet session | ✓ | — | — |
+| `HOLDING_ADMIN_TOKEN` | — | ✓ | ✓ |
+| contract owner (on-chain) | — | the account that signs `register_source` | the account that signs the write |
+
+`HOLDING_OPERATOR_ADDRESSES` is a Reporter-side allowlist: it marks which
+signed-in wallets count as operators. Empty means *nobody*, not everybody.
 
 ---
 

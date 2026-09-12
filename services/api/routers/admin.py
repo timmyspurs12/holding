@@ -13,7 +13,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, Depends, FastAPI, Header, HTTPException, Request, status
+from fastapi import APIRouter, Depends, Header, HTTPException, Request, status
 from pydantic import BaseModel, Field
 
 from ...lib.genlayer.base import ContractRejected
@@ -21,7 +21,12 @@ from ...lib.genlayer.client import get_registry
 from ...lib.genlayer.types import FinalityAttestation
 from ..security import idempotency_key, require_admin
 
-router = APIRouter(prefix="/admin", tags=["admin"])
+def admin_guard(request: Request, x_admin_token: Optional[str] = Header(default=None)) -> None:
+    """Runs before body validation: authorization first, parsing second."""
+    require_admin(request.app.state.config, x_admin_token)
+
+
+router = APIRouter(prefix="/admin", tags=["admin"], dependencies=[Depends(admin_guard)])
 
 # In DEMO mode writes are sent by the registry owner / attestor; on a live
 # network the operator's account signs them.
@@ -36,8 +41,8 @@ def _store(request: Request):
     return request.app.state.idempotency
 
 
-def _guard(request: Request, token: Optional[str], key: Optional[str], scope: str):
-    require_admin(request.app.state.config, token)
+def _guard(request: Request, key: Optional[str], scope: str):
+    """Replay protection only — authorization is the router's admin_guard."""
     return _store(request).get(scope, idempotency_key(key))
 
 
@@ -85,10 +90,9 @@ class RejectRequest(BaseModel):
 def create_holding(
     payload: CreateHoldingRequest,
     request: Request,
-    x_admin_token: Optional[str] = Header(default=None),
     idempotency_key_header: Optional[str] = Header(default=None, alias="Idempotency-Key"),
 ):
-    cached = _guard(request, x_admin_token, idempotency_key_header, "create_holding")
+    cached = _guard(request, idempotency_key_header, "create_holding")
     if cached:
         return {**cached, "replayed": True}
 
@@ -135,10 +139,9 @@ def attest_finality(
     holding_id: str,
     payload: FinalityRequest,
     request: Request,
-    x_admin_token: Optional[str] = Header(default=None),
     idempotency_key_header: Optional[str] = Header(default=None, alias="Idempotency-Key"),
 ):
-    cached = _guard(request, x_admin_token, idempotency_key_header, f"attest:{holding_id}")
+    cached = _guard(request, idempotency_key_header, f"attest:{holding_id}")
     if cached:
         return {**cached, "replayed": True}
 
@@ -171,10 +174,9 @@ def attest_finality(
 def create_citation(
     payload: CitationRequest,
     request: Request,
-    x_admin_token: Optional[str] = Header(default=None),
     idempotency_key_header: Optional[str] = Header(default=None, alias="Idempotency-Key"),
 ):
-    cached = _guard(request, x_admin_token, idempotency_key_header, "cite")
+    cached = _guard(request, idempotency_key_header, "cite")
     if cached:
         return {**cached, "replayed": True}
 
@@ -213,10 +215,9 @@ def reject_holding(
     holding_id: str,
     payload: RejectRequest,
     request: Request,
-    x_admin_token: Optional[str] = Header(default=None),
     idempotency_key_header: Optional[str] = Header(default=None, alias="Idempotency-Key"),
 ):
-    cached = _guard(request, x_admin_token, idempotency_key_header, f"reject:{holding_id}")
+    cached = _guard(request, idempotency_key_header, f"reject:{holding_id}")
     if cached:
         return {**cached, "replayed": True}
 
@@ -233,3 +234,100 @@ def reject_holding(
             "simulated": result.simulated,
         },
     )
+
+
+# ---------------------------------------------------------------------------
+# Source-contract proposals
+#
+# The wallet half of registration lives in /operator; a wallet can only
+# propose. Approving is what calls register_source() on the contract, so it
+# stays behind HOLDING_ADMIN_TOKEN.
+# ---------------------------------------------------------------------------
+
+
+class DecisionRequest(BaseModel):
+    note: str = Field(default="", max_length=500)
+
+
+def _decide(request: Request, proposal_id: str, approve: bool, payload: DecisionRequest):
+    from ..sources import APPROVED, REJECTED, ProposalError
+
+    store = request.app.state.sources
+    proposal = store.get(proposal_id)
+    if proposal is None:
+        raise HTTPException(status_code=404, detail=f"unknown proposal {proposal_id}")
+
+    transaction_reference = None
+    registered_on_chain = False
+    contract_error = None
+
+    if approve:
+        registry = _registry(request)
+        try:
+            result = registry.register_source(address=proposal.contract_address, allowed=True, sender=OWNER)
+            transaction_reference = result.transaction_reference
+        except ContractRejected as error:
+            contract_error = str(error)
+        except Exception as error:  # pragma: no cover - depends on the network
+            contract_error = str(error)
+        else:
+            registered_on_chain = registry.is_registered_source(proposal.contract_address)
+
+    try:
+        decided = store.decide(
+            proposal_id,
+            status=APPROVED if (approve and contract_error is None) else REJECTED,
+            decided_by="admin",
+            note=payload.note or (contract_error or ""),
+            transaction_reference=transaction_reference,
+        )
+    except ProposalError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+
+    body = {
+        "proposal_id": proposal_id,
+        "status": decided.status,
+        "contract_address": decided.contract_address,
+        "domain": decided.domain,
+        "contract_class": decided.contract_class,
+        "submitted_by": decided.submitted_by,
+        "decided_at": decided.decided_at,
+        "decision_note": decided.decision_note,
+        "transaction_reference": decided.transaction_reference,
+        "registered_on_chain": registered_on_chain,
+        "simulated": decided.simulated,
+        "network": request.app.state.config.info().model_dump(),
+    }
+    if contract_error:
+        body["contract_error"] = contract_error
+        body["status"] = REJECTED
+        body["note"] = "the contract refused the registration; the proposal stays decided as REJECTED"
+    return body
+
+
+@router.post("/source-contracts/{proposal_id}/approve", summary="Approve a proposal and register the source on-chain")
+def approve_source(
+    proposal_id: str,
+    payload: DecisionRequest,
+    request: Request,
+    idempotency_key_header: Optional[str] = Header(default=None, alias="Idempotency-Key"),
+):
+    cached = _guard(request, idempotency_key_header, f"approve:{proposal_id}")
+    if cached:
+        return {**cached, "replayed": True}
+    body = _decide(request, proposal_id, True, payload)
+    return _remember(request, f"approve:{proposal_id}", idempotency_key_header or "", body)
+
+
+@router.post("/source-contracts/{proposal_id}/reject", summary="Decline a proposal")
+def reject_source(
+    proposal_id: str,
+    payload: DecisionRequest,
+    request: Request,
+    idempotency_key_header: Optional[str] = Header(default=None, alias="Idempotency-Key"),
+):
+    cached = _guard(request, idempotency_key_header, f"reject:{proposal_id}")
+    if cached:
+        return {**cached, "replayed": True}
+    body = _decide(request, proposal_id, False, payload)
+    return _remember(request, f"reject:{proposal_id}", idempotency_key_header or "", body)

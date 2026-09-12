@@ -23,7 +23,7 @@ Full design, assumptions and limitations: **[docs/ARCHITECTURE.md](docs/ARCHITEC
 | Reporter API | built, running | `services/api/` |
 | Indexer (read-side mirror) | built | `services/indexer/` |
 | Frontend | built, consumes the API | `app/`, `lib/` |
-| Tests | 124 passing | `tests/` |
+| Tests | 127 passing | `tests/` |
 | Deployment to Bradbury / mainnet | **not deployed** | see Honest status |
 
 ---
@@ -31,7 +31,7 @@ Full design, assumptions and limitations: **[docs/ARCHITECTURE.md](docs/ARCHITEC
 ## Quickstart
 
 ```bash
-# 1 · Python
+# 1 · Python (3.11–3.13 recommended; 3.14 works with pydantic >= 2.12)
 pip install -r requirements.txt
 cp .env.example .env
 
@@ -48,7 +48,7 @@ npm install
 HOLDING_API_URL=http://127.0.0.1:8000 npm run dev     # http://localhost:3000
 
 # 5 · tests
-pytest tests/ -q                                       # 124 passed
+python -m pytest tests/ -q                                      # 163 passed
 
 # 6 · indexer
 python -m services.indexer.indexer --once
@@ -120,11 +120,41 @@ GET  /holdings/{id}/precedent        what a panel would be shown
 GET  /holdings/{id}/distinguishments
 GET  /cases · GET /cases/{id}
 POST /admin/holdings · /admin/holdings/{id}/finality · /admin/holdings/{id}/reject · /admin/citations
+POST /admin/source-contracts/{id}/approve · /reject
 POST /demo/cases · /demo/seed        labelled simulation; disabled on mainnet
+
+GET  /auth/config                    what a wallet signs, is sign-in on
+GET  /auth/nonce?address=            single-use sign-in nonce
+POST /auth/verify                    signature -> session token
+GET  /operator/source-contracts      source-contract proposals (public)
+POST /operator/source-contracts      propose one (X-Session-Token)
 ```
 
 Writes need `X-Admin-Token` and an `Idempotency-Key`. With no admin token configured
 every write returns `503` — the API fails closed.
+
+### Connect a wallet
+
+Reading HOLDING needs nothing: it is a public record. Connecting a wallet is the
+way to *register a source contract* — the thing that lets your own Intelligent
+Contract emit holdings.
+
+1. Click **Connect wallet** and approve the request in your wallet.
+2. Sign the nonce the Reporter issues. It is a `personal_sign` message: free,
+   off-chain, and it cannot move funds.
+3. Fill in the contract address, its domain and its class on `/developers`.
+
+That queues a `PENDING` proposal and writes nothing. An operator checks the
+deployment and approves it, and only the approval calls `register_source()` on
+the registry contract — signing a message with a wallet must not by itself let
+anyone add an emitter to the canonical corpus.
+
+Injected wallets only (MetaMask, Rabby, Brave, Frame). WalletConnect and mobile
+wallets do not inject into a page, so they are not supported yet.
+
+The browser calls `/api/reporter/*` on its own origin and Next proxies it to the
+API (`next.config.mjs`), so there is no CORS to configure and no API address in
+the page.
 
 ---
 

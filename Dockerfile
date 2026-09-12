@@ -9,10 +9,10 @@ ENV PYTHONUNBUFFERED=1 \
 
 WORKDIR /app
 
-COPY requirements.txt ./
-# genlayer-py pulls web3/eth tooling; installing it is cheap and keeps the
-# live adapter importable inside the image.
-RUN pip install --no-cache-dir -r requirements.txt
+COPY requirements.txt requirements-live.txt ./
+# requirements-live.txt adds genlayer-py so the same image can serve live
+# networks; DEMO mode and the tests only need requirements.txt.
+RUN pip install --no-cache-dir -r requirements.txt -r requirements-live.txt
 
 COPY contracts ./contracts
 COPY shared ./shared

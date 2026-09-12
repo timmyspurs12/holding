@@ -25,6 +25,7 @@ from .types import (
     Provenance,
     RegistryStats,
     TxReceipt,
+    WriteResult,
 )
 
 RELATIONSHIPS = ("CITES", "FOLLOWS", "DISTINGUISHES")
@@ -307,6 +308,25 @@ class HoldingRegistryContract:
 
     def reject_holding(self, *, holding_id: str, reason: str, sender: str = ""):
         return self.chain.write(self.address, "reject_holding", [holding_id, reason], sender=sender)
+
+    # -- registration (owner-only writes on the contract) ----------------
+    def register_source(self, *, address: str, allowed: bool = True, sender: str = "") -> WriteResult:
+        """Allow (or revoke) a contract that may emit holdings.
+
+        This is the gate in front of the corpus: an unregistered address cannot
+        create holdings, so approving a proposal is what actually admits a
+        source.
+        """
+        return self.chain.write(self.address, "register_source", [address, bool(allowed)], sender=sender)
+
+    def register_attestor(self, *, address: str, allowed: bool = True, sender: str = "") -> WriteResult:
+        return self.chain.write(self.address, "register_attestor", [address, bool(allowed)], sender=sender)
+
+    def is_registered_source(self, address: str) -> bool:
+        try:
+            return bool(self.chain.read(self.address, "is_registered_source", [address]))
+        except Exception:  # pragma: no cover - depends on the network
+            return False
 
     # -- the loop (used by the demo runner and the simulation endpoint) --
     def submit_case(self, case_id: str, facts: Sequence[str], sender: str = ""):

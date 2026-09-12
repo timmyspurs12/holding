@@ -5,12 +5,16 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Optional, Tuple
 
 from .types import NETWORK_LABELS, NetworkInfo, NetworkMode
 
+import re
+
 DEMO_REGISTRY = "0xDEMO000000000000000000000000000000000001"
 DEMO_ADJUDICATOR = "0xDEMO000000000000000000000000000000000002"
+
+ADDRESS_PATTERN = re.compile(r"^0x[0-9a-fA-F]{40}$")
 
 
 @dataclass(frozen=True)
@@ -23,6 +27,13 @@ class GenLayerConfig:
     adjudicator_address: str = DEMO_ADJUDICATOR
     private_key: str = field(default="", repr=False)  # never logged
     admin_token: str = field(default="", repr=False)
+    # Wallet sign-in. session_secret is optional: it defaults to a value derived
+    # from admin_token (see services/api/wallet.py::session_secret).
+    session_secret: str = field(default="", repr=False)
+    operator_addresses: Tuple[str, ...] = ()
+    # Origin stamped into the sign-in message (behind a proxy the request host
+    # is not the public one, so it can be pinned here).
+    public_origin: str = ""
 
     @property
     def simulated(self) -> bool:
@@ -67,6 +78,17 @@ class GenLayerConfig:
             if not chain_raw:
                 chain_raw = str(DEFAULT_CHAIN_ID.get(network, "") or "")
 
+        operators = tuple(
+            address.strip().lower()
+            for address in (env.get("HOLDING_OPERATOR_ADDRESSES") or "").split(",")
+            if address.strip()
+        )
+        for address in operators:
+            if not ADDRESS_PATTERN.match(address):
+                raise ValueError(
+                    f"HOLDING_OPERATOR_ADDRESSES contains an invalid address: {address!r}"
+                )
+
         return cls(
             mode=mode,
             network=network or "demo",
@@ -76,6 +98,9 @@ class GenLayerConfig:
             adjudicator_address=adjudicator or DEMO_ADJUDICATOR,
             private_key=key,
             admin_token=(env.get("HOLDING_ADMIN_TOKEN") or "").strip(),
+            session_secret=(env.get("HOLDING_SESSION_SECRET") or "").strip(),
+            operator_addresses=operators,
+            public_origin=(env.get("HOLDING_PUBLIC_ORIGIN") or "").strip().rstrip("/"),
         )
 
 
@@ -83,13 +108,15 @@ class GenLayerConfig:
 DEFAULT_RPC = {
     "testnet_bradbury": "https://rpc-bradbury.genlayer.com",
     "testnet_asimov": "https://rpc-asimov.genlayer.com",
-    "studionet": "https://studio-rpc.genlayer.com",
+    "studio_devnet": "https://studio-dev.genlayer.com/api",
+    "studionet": "https://studio.genlayer.com/api",
     "localnet": "http://127.0.0.1:4000/api",
 }
 
 DEFAULT_CHAIN_ID = {
     "testnet_bradbury": 4221,
     "testnet_asimov": 61999,
+    "studio_devnet": 61997,
     "studionet": 61999,
     "localnet": 61127,
 }

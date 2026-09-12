@@ -1,0 +1,11 @@
+# Optional: live GenLayer access (GENLAYER_NETWORK=bradbury|asimov|mainnet).
+# Not needed for DEMO mode, the Reporter API's demo paths, or the test suite.
+#
+# Consensus v0.6 requires a fee payload on every deploy and write. Those fields
+# exist only in genlayer-py >= 0.19.0rc1, so that is what you need to deploy:
+#
+#   pip install -r requirements-live.txt
+#
+# 0.18.0 is listed below only for reference: it can still READ a live network,
+# but every write will be rejected by a v0.6 node.
+genlayer-py==0.19.0rc2

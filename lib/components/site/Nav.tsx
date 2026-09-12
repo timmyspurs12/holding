@@ -4,6 +4,7 @@ import Link from "next/link";
 import { usePathname } from "next/navigation";
 import { useEffect, useState } from "react";
 import { cx } from "../ui/primitives";
+import { WalletButton } from "@/lib/wallet/WalletButton";
 import { Menu, X } from "lucide-react";
 
 const LINKS = [
@@ -22,7 +23,22 @@ const MOBILE_LINKS = [
   { href: "/developers", label: "Devs" },
 ];
 
-export function Nav() {
+export interface NetworkBadge {
+  mode: "DEMO" | "TESTNET" | "MAINNET";
+  network: string;
+  simulated: boolean;
+  registry_address: string;
+}
+
+const PILL_TONE: Record<string, string> = {
+  DEMO: "bg-copper/90",
+  TESTNET: "bg-verdict/90",
+  MAINNET: "bg-verdict/90",
+};
+
+export function Nav({ network }: { network?: NetworkBadge | null }) {
+  const mode = network?.mode ?? "DEMO";
+  const simulated = network?.simulated ?? true;
   const pathname = usePathname();
   const [scrolled, setScrolled] = useState(false);
   const [open, setOpen] = useState(false);
@@ -79,15 +95,10 @@ export function Nav() {
 
           <div className="flex items-center gap-3">
             <span className="hidden items-center gap-2 rounded-[5px] border border-white/[0.12] px-[8px] py-[3px] font-mono text-[10px] uppercase tracking-[0.14em] text-stone sm:inline-flex">
-              <span className="h-[5px] w-[5px] rounded-full bg-verdict/90" />
-              Testnet
+              <span className={`h-[5px] w-[5px] rounded-full ${PILL_TONE[mode] ?? "bg-copper/90"}`} />
+              {mode}
             </span>
-            <Link
-              href="/developers"
-              className="hidden rounded-[7px] border border-white/[0.14] px-[13px] py-[7px] text-[12px] text-paper transition-all duration-200 hover:border-copper/50 hover:text-copper md:inline-block"
-            >
-              Connect
-            </Link>
+            <WalletButton className="hidden md:inline-flex" />
             <button
               aria-label="Menu"
               onClick={() => setOpen((v) => !v)}
@@ -102,6 +113,10 @@ export function Nav() {
         {open ? (
           <div className="border-t border-white/[0.08] bg-obsidian md:hidden">
             <div className="shell py-4">
+              <p className="mb-3 font-mono text-[9px] uppercase tracking-[0.18em] text-muted">
+                {mode}
+                {simulated ? " · simulated records" : " · live contract data"}
+              </p>
               {[{ href: "/", label: "Home" }, ...LINKS].map((l) => (
                 <Link
                   key={l.href}
@@ -117,6 +132,10 @@ export function Nav() {
               <Link href="/precedent" className="block py-3 text-[15px] text-stone">
                 Precedent console
               </Link>
+              <div className="mt-3 flex items-center justify-between border-t border-white/[0.06] pt-3">
+                <span className="font-mono text-[9px] uppercase tracking-[0.18em] text-muted">Wallet</span>
+                <WalletButton />
+              </div>
             </div>
           </div>
         ) : null}

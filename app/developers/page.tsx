@@ -2,6 +2,7 @@ import type { Metadata } from "next";
 import { ArrowUpRight } from "lucide-react";
 import { PageHeader } from "@/lib/components/site/PageHeader";
 import { Label, Rule, MetaTag } from "@/lib/components/ui/primitives";
+import { RegisterSource } from "@/lib/components/operator/RegisterSource";
 
 export const metadata: Metadata = {
   title: "Developers",
@@ -141,6 +142,8 @@ export default function DevelopersPage() {
           </div>
         </div>
       </section>
+
+      <RegisterSource />
 
       {/* ---------- schema ---------- */}
       <section id="schema" className="scroll-mt-20 border-t border-white/[0.08]">

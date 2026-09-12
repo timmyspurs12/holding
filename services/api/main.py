@@ -28,6 +28,8 @@ from ..lib.genlayer.config import GenLayerConfig
 from ..lib.genlayer.types import Holding, NetworkInfo
 from .search import SearchQuery, precedent_view, search
 from .security import IdempotencyStore, RateLimiter, client_of, require_admin
+from .sources import SourceContractStore
+from .wallet import NonceStore
 
 logger = logging.getLogger("holding.api")
 
@@ -79,6 +81,8 @@ def create_app(config: Optional[GenLayerConfig] = None) -> FastAPI:
     app.state.config = config
     app.state.limiter = RateLimiter(int(os.getenv("RATE_LIMIT_PER_MINUTE", RATE_LIMIT_PER_MINUTE) or RATE_LIMIT_PER_MINUTE))
     app.state.idempotency = IdempotencyStore()
+    app.state.nonces = NonceStore()
+    app.state.sources = SourceContractStore()
     app.state.started_at = int(time.time())
 
     if CORS_ORIGINS:
@@ -86,13 +90,17 @@ def create_app(config: Optional[GenLayerConfig] = None) -> FastAPI:
             CORSMiddleware,
             allow_origins=CORS_ORIGINS,
             allow_methods=["GET", "POST"],
-            allow_headers=["Content-Type", "X-Admin-Token", "Idempotency-Key"],
+            allow_headers=["Content-Type", "X-Admin-Token", "X-Session-Token", "Authorization", "Idempotency-Key"],
         )
 
     from .routers.admin import router as admin_router
+    from .routers.auth import router as auth_router
     from .routers.demo import router as demo_router
+    from .routers.operator import router as operator_router
 
     app.include_router(admin_router)
+    app.include_router(auth_router)
+    app.include_router(operator_router)
     app.include_router(demo_router)
 
     # -- dependencies -------------------------------------------------
@@ -155,6 +163,38 @@ def create_app(config: Optional[GenLayerConfig] = None) -> FastAPI:
         return JSONResponse(status_code=503, content={"detail": str(error), "type": "adapter_unavailable"})
 
     # -- meta ----------------------------------------------------------
+    @app.get("/", tags=["meta"], summary="Service index")
+    def index():
+        """So opening the API root in a browser is useful, not a 404."""
+        return {
+            "service": "HOLDING Reporter API",
+            "version": "1.0.0",
+            "docs": "/docs",
+            "network": network().model_dump(),
+            "endpoints": [
+                "/health",
+                "/stats",
+                "/domains",
+                "/holdings",
+                "/holdings/search?q=&domain=&status=&min_authority=",
+                "/holdings/{holding_id}",
+                "/holdings/{holding_id}/citations",
+                "/holdings/{holding_id}/precedent",
+                "/holdings/{holding_id}/distinguishments",
+                "/cases",
+                "/cases/{case_id}",
+            ],
+            "wallet": [
+                "GET /auth/config",
+                "GET /auth/nonce?address=0x…",
+                "POST /auth/verify",
+                "GET /operator/source-contracts",
+                "POST /operator/source-contracts (X-Session-Token)",
+                "GET /operator/me (X-Session-Token)",
+            ],
+            "writes": "POST /admin/* requires X-Admin-Token and Idempotency-Key",
+        }
+
     @app.get("/health", tags=["meta"], summary="Service, network and registry health")
     def health():
         reg = get_registry(app.state.config)
@@ -330,10 +370,12 @@ def create_app(config: Optional[GenLayerConfig] = None) -> FastAPI:
             payload["holding"] = holding.model_dump() if holding else None
         return payload
 
-    @app.post("/admin/reload", tags=["admin"], summary="Drop cached chain clients")
+    @app.post("/admin/reload", tags=["admin"], summary="Drop cached chain clients and rebuild")
     def reload(x_admin_token: Optional[str] = Header(default=None)):
         require_admin(config, x_admin_token)
         reset()
+        get_registry(config)          # rebuild the chain client
+        _seed_demo_corpus(app.state)  # DEMO mode only; a no-op on live networks
         return {"reloaded": True, "network": network().model_dump()}
 
     return app
