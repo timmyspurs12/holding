@@ -29,3 +29,8 @@ httpx>=0.27
 # not `demo`. Install it separately so DEMO mode and the test suite stay
 # installable on any platform:
 #   pip install -r requirements-live.txt
+#
+# That file pins genlayer-py >= 0.19.0rc1 — the first release whose
+# write_contract()/deploy_contract() accept the Consensus v0.6 `fees` payload.
+# It needs Python >= 3.12, which is why it is not required here: everything
+# above still runs on 3.11.

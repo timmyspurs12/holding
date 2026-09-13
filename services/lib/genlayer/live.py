@@ -16,10 +16,27 @@ version sniffing, so it works with either:
   * genlayer-py >= 0.19  -> estimate the fee for this exact call and send it
   * genlayer-py <= 0.18  -> send the call unchanged
 
-HOLDING_FEE_ESTIMATE=auto (default) | off
-    auto — estimate and attach fees when the SDK supports them; if estimation
-           fails, log and send without (older nodes still accept that).
-    off  — never attach fees.
+Choosing an estimator is not just "call the most specific one". In
+genlayer-py 0.19 `estimate_transaction_fees_for_write()` is **Studio-only**: on
+any non-Studio chain (Bradbury included) it raises
+
+    Target write fee estimation is only supported on Studio networks
+
+because it is implemented on top of the `sim_*` RPC surface. The generic
+`estimate_transaction_fees()` has no such restriction — it prices the call from
+the chain's own FeeManager — so it is the correct estimator on a live testnet,
+and the only one available for a deploy (there is no
+`estimate_transaction_fees_for_deploy()` in the SDK).
+
+So the order is: try the call-specific estimator, and on a *permanent*
+"unsupported here" answer fall straight back to the generic one instead of
+retrying something that can never succeed.
+
+HOLDING_FEE_ESTIMATE=auto (default) | strict | off
+    auto   — estimate and attach fees when the SDK supports them; if estimation
+             fails, log and send without (older nodes still accept that).
+    strict — a failed estimate is an error; never send a feeless write.
+    off    — never attach fees.
 """
 
 from __future__ import annotations
@@ -57,6 +74,22 @@ LIFECYCLE_TO_STATUS_CODE = {
 }
 
 logger = logging.getLogger("holding.genlayer.live")
+
+# A "this estimator does not apply to this chain" answer. It is permanent for
+# the run, so it must fall through to the generic estimator rather than being
+# reported as a fee-estimation failure.
+ESTIMATOR_UNSUPPORTED_MARKERS = (
+    "only supported on studio",
+    "not supported on this chain",
+    "missing fee_manager",
+    "no fee manager",
+)
+
+
+def _is_estimator_unsupported(error: Exception) -> bool:
+    text = str(error).lower()
+    return any(marker in text for marker in ESTIMATOR_UNSUPPORTED_MARKERS)
+
 
 STATUS_NAMES = {
     0: "PENDING",
@@ -170,24 +203,48 @@ class LiveChain(Chain):
         }
 
     def _estimate_write_fees(self, address: str, method: str, args: List[Any]) -> Optional[Dict[str, Any]]:
+        """Price this write, preferring the call-specific estimator.
+
+        Falls back to the generic estimator when the specific one is not
+        available *on this chain* — see ESTIMATOR_UNSUPPORTED_MARKERS.
+        """
         if self._fee_mode == "off":
             return None
-        estimator = getattr(self.client, "estimate_transaction_fees_for_write", None)
-        if estimator is None:
+
+        specific = getattr(self.client, "estimate_transaction_fees_for_write", None)
+        if specific is not None:
+            try:
+                return self._as_fee_payload(
+                    specific(
+                        address=address,
+                        function_name=method,
+                        args=args,
+                        account=self.account,
+                    )
+                )
+            except Exception as error:  # pragma: no cover - network dependent
+                if not _is_estimator_unsupported(error):
+                    return self._fee_failure(method, error)
+                logger.debug(
+                    "per-call fee estimation is unavailable on this chain (%s); "
+                    "using the generic estimator",
+                    error,
+                )
+
+        generic = getattr(self.client, "estimate_transaction_fees", None)
+        if generic is None:
             return None
         try:
-            estimate = estimator(
-                address=address,
-                function_name=method,
-                args=args,
-                account=self.account,
-            )
+            return self._as_fee_payload(generic())
         except Exception as error:  # pragma: no cover - network dependent
-            logger.warning("fee estimation failed for %s: %s", method, error)
-            if self._fee_mode == "strict":
-                raise AdapterError(f"fee estimation failed for {method}: {error}") from error
-            return None
-        return self._as_fee_payload(estimate)
+            return self._fee_failure(method, error)
+
+    def _fee_failure(self, method: str, error: Exception) -> None:
+        """Honour HOLDING_FEE_ESTIMATE=strict, else degrade to a feeless send."""
+        logger.warning("fee estimation failed for %s: %s", method, error)
+        if self._fee_mode == "strict":
+            raise AdapterError(f"fee estimation failed for {method}: {error}") from error
+        return None
 
     # -- writes -------------------------------------------------------
     def write(self, address: str, method: str, args: Sequence[Any] = (), sender: str = "") -> WriteResult:

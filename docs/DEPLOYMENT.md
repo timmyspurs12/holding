@@ -209,6 +209,13 @@ dies, the site is unaffected.
    estimates the fee for each specific call, and attaches it. On 0.18 and
    earlier it sends the call unchanged.
 
+   Which estimator is used depends on the network, and this is not cosmetic:
+   `estimate_transaction_fees_for_write()` is built on the Studio `sim_*` RPC
+   surface, so on Bradbury/Asimov it raises *"Target write fee estimation is
+   only supported on Studio networks"*. There is no `..._for_deploy()` at all.
+   Both paths therefore fall back to the generic `estimate_transaction_fees()`,
+   which prices the call from the chain's own FeeManager.
+
    Escape hatches:
 
    ```bash
@@ -220,8 +227,18 @@ dies, the site is unaffected.
    top it up with `client.top_up_fees(tx_id, distribution, value)` rather than
    resubmitting — resubmitting replays the call.
 
-   `pip install "genlayer-py==0.19.0rc*"` does **not** work: pip does not accept
-   a wildcard in a `==` specifier. Use the exact version, as above.
+   A note on the version specifier, because the obvious ones fail:
+
+   | specifier | result |
+   |---|---|
+   | `genlayer-py==0.19.0` | **no match** — 0.19.0 final is not on PyPI yet |
+   | `genlayer-py>=0.19.0` | **no match** — under PEP 440 an `rc` sorts *below* its final |
+   | `genlayer-py==0.19.0rc*` | pip rejects a wildcard in a `==` specifier |
+   | `genlayer-py>=0.19.0rc1` | works — installs today's rc2, accepts 0.19.0 final later |
+
+   `requirements-live.txt` uses the last one. Python **3.12+** is required
+   (genlayer-py declares `Requires-Python >=3.12`); on 3.11 the install resolves
+   to an ancient 0.8.x, or the import fails outright.
 
 3. **Deploy the contracts.** The repo ships a deployer that does both, in order,
    waits for real `FINALIZED` receipts, and prints the `.env` block:
@@ -411,7 +428,18 @@ Measured side by side, same network, same moment:
 
 `deploy_contracts.py` now detects this automatically. If the network's fee
 policy call reverts, it swaps in the pre-fee consensus ABI and omits fees (they
-can only travel on the fee-bearing path). You will see:
+can only travel on the fee-bearing path).
+
+> **Read the diagnosis below before trusting the fallback.** `get_current_fee_policy()`
+> reverting does *not* on its own prove the network is pre-fee — in genlayer-py
+> 0.19 that call reverts whenever the FeeManager lacks `quoteGasPrice()` /
+> `messageFeeParamsBudgetFloor()`, which is a *fee-manager version* mismatch, not
+> a ConsensusMain one. Because the fallback also forces `FEE_MODE=off`, a wrong
+> answer here is expensive: on a genuine v0.6 node it produces exactly the
+> feeless `FeesDistributionMissing` rejection it is meant to avoid. If the deploy
+> still fails after the switch, re-run with `--consensus-abi fees` and compare.
+
+You will see:
 
 ```
   ! this network does not implement the v0.6 fee-bearing addTransaction
@@ -461,6 +489,24 @@ mismatch described above.
   consensus.
 - Fee estimation is retried (env `HOLDING_FEE_RETRIES`, default 10) instead of
   degrading to a feeless transaction.
+- Deploys are priced too. There is no `estimate_transaction_fees_for_deploy()`
+  in genlayer-py, so a deploy is priced with the generic
+  `estimate_transaction_fees()`; previously the deploy path could reach for a
+  method that does not exist and send no fees at all.
+- `estimate_transaction_fees_for_write()` is **Studio-only** — on Bradbury it
+  raises *"Target write fee estimation is only supported on Studio networks"*.
+  That is permanent, so it now falls straight through to the generic estimator
+  instead of exhausting 10 retries and then sending a feeless write.
+- The legacy-ABI swap keeps the rest of the consensus ABI. It used to replace
+  the whole thing with a single `addTransaction` entry, which deleted the
+  `NewTransaction` / `CreatedTransaction` events genlayer-py decodes the
+  consensus transaction id from — so a fallback deploy could not report its own
+  transaction id.
+- A receipt-wait timeout no longer strands the run. `Transaction … is not in the
+  chain after 600 seconds` comes from web3 *inside* the SDK, after the EVM
+  transaction was already submitted; the script now re-reads that receipt and
+  recovers the consensus transaction id instead of asking you to copy an address
+  out of the explorer (env `HOLDING_DEPLOY_RECOVER_WAIT`, default 120 s).
 - `--fees {auto,zero,off}` sends an explicit fee distribution.
 - `--adjudicator-address` resumes a partial deploy without redeploying.
 - `studio_devnet` is selectable as `--network`.

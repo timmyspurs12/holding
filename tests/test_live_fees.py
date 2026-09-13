@@ -169,3 +169,70 @@ def test_snake_case_estimates_are_accepted():
 
     fees = client.write_calls[0]["fees"]
     assert fees == {"distribution": {}, "feeValue": 7, "messageAllocations": []}
+
+
+# ---------------------------------------------------------------------------
+# Non-Studio chains: the per-call estimator is not available there
+# ---------------------------------------------------------------------------
+
+STUDIO_ONLY = "Target write fee estimation is only supported on Studio networks"
+
+
+class NonStudioClient(FakeClient):
+    """Bradbury's real shape in genlayer-py 0.19.
+
+    estimate_transaction_fees_for_write() is implemented on the Studio `sim_*`
+    RPC surface, so on a live testnet it refuses outright. The generic
+    estimate_transaction_fees() prices the same call from the FeeManager and is
+    what the adapter has to reach for.
+    """
+
+    def __init__(self, generic_error: Exception | None = None):
+        super().__init__(with_fees=True)
+        self.generic_error = generic_error
+        self.generic_calls = 0
+
+    def estimate_transaction_fees_for_write(self, **kwargs):
+        self.estimates.append({"function_name": kwargs.get("function_name")})
+        raise RuntimeError(STUDIO_ONLY)
+
+    def estimate_transaction_fees(self, **kwargs):
+        self.generic_calls += 1
+        if self.generic_error:
+            raise self.generic_error
+        return {"distribution": {"rotations": [0]}, "feeValue": 555, "messageAllocations": []}
+
+
+def test_write_on_a_non_studio_chain_still_carries_fees():
+    """The regression: a Studio-only estimator made the adapter send no fees.
+
+    A v0.6 node rejects that with FeesDistributionMissing, so the write never
+    lands — which is exactly the failure this whole change set is about.
+    """
+    client = NonStudioClient()
+    chain = make_chain(client)
+    chain.write(ADDRESS, "register_source", [ADDRESS, True])
+
+    sent = client.write_calls[0]["fees"]
+    assert sent is not None, "a v0.6 write must carry a fee payload"
+    assert sent["feeValue"] == 555
+    assert client.generic_calls == 1
+
+
+def test_studio_only_refusal_is_not_reported_as_a_failure_in_strict_mode(monkeypatch):
+    """Strict mode must not trip on a fallback that succeeded."""
+    monkeypatch.setenv("HOLDING_FEE_ESTIMATE", "strict")
+    client = NonStudioClient()
+    chain = make_chain(client)
+    chain.write(ADDRESS, "register_source", [ADDRESS, True])
+
+    assert client.write_calls[0]["fees"]["feeValue"] == 555
+
+
+def test_strict_mode_still_refuses_when_every_estimator_fails(monkeypatch):
+    monkeypatch.setenv("HOLDING_FEE_ESTIMATE", "strict")
+    client = NonStudioClient(generic_error=RuntimeError("node refused the estimate"))
+    chain = make_chain(client)
+    with pytest.raises(AdapterError, match="fee estimation failed"):
+        chain.write(ADDRESS, "register_source", [ADDRESS, True])
+    assert client.write_calls == []

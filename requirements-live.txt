@@ -1,11 +1,20 @@
 # Optional: live GenLayer access (GENLAYER_NETWORK=bradbury|asimov|mainnet).
 # Not needed for DEMO mode, the Reporter API's demo paths, or the test suite.
 #
-# Consensus v0.6 requires a fee payload on every deploy and write. Those fields
-# exist only in genlayer-py >= 0.19.0rc1, so that is what you need to deploy:
+# Consensus v0.6 requires a fee payload on every deploy and write. The `fees`
+# parameter on write_contract()/deploy_contract() first appears in 0.19.0rc1:
 #
 #   pip install -r requirements-live.txt
 #
-# 0.18.0 is listed below only for reference: it can still READ a live network,
-# but every write will be rejected by a v0.6 node.
-genlayer-py==0.19.0
+# Requires Python >= 3.12 (genlayer-py declares Requires-Python >=3.12).
+#
+# Why the `rc1` in the specifier, and not a plain `>=0.19.0`:
+# there is no final 0.19.0 on PyPI yet — the newest release is 0.19.0rc2. Under
+# PEP 440 a release candidate sorts BELOW its final, so `>=0.19.0` (and the
+# `==0.19.0` that used to be pinned here) match nothing at all and pip fails with
+# "No matching distribution found". `>=0.19.0rc1` is the narrowest specifier that
+# both installs today's rc2 and keeps accepting 0.19.0 final and later.
+#
+# 0.18.0 can still READ a live network, but it has no `fees` parameter, so every
+# write it sends is rejected by a v0.6 node.
+genlayer-py>=0.19.0rc1

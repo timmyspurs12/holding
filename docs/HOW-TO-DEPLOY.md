@@ -200,8 +200,9 @@ mainnet. Nothing here spends real money — testnet uses faucet GEN.
    pip install -r requirements-live.txt
    ```
 
-   (This installs `genlayer-py==0.19.0rc2`, which carries the fee fields consensus
-   v0.6 requires. The repo already wires fees up for you — no fee code to write.)
+   (This installs `genlayer-py>=0.19.0rc1` — currently 0.19.0rc2 — which carries
+   the fee fields consensus v0.6 requires. Needs Python 3.12+. The repo already
+   wires fees up for you — no fee code to write.)
 
 3. **Deploy the contracts.** This does a dry-run first (safe, no network), then the
    real deploy. It prints a ready-made `.env` block at the end:

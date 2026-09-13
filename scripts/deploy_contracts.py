@@ -25,6 +25,9 @@ Notes
   genlayer-py >= 0.19.0rc1. This script detects them by signature and estimates
   a fee per call; on 0.18 and earlier it sends the call unchanged, which a v0.6
   node will reject. Set HOLDING_FEE_ESTIMATE=off to suppress fee estimation.
+  Estimator choice matters: estimate_transaction_fees_for_write() is Studio-only
+  and there is no ..._for_deploy() at all, so on a live testnet both deploys and
+  writes are priced with the generic estimate_transaction_fees().
 * The deployer account becomes the registry OWNER by default: it is the only
   address that can register source contracts and attestors.
 * Deploying is not the last step. The registry refuses holdings from
@@ -46,7 +49,10 @@ Notes
 from __future__ import annotations
 
 # Bump with every fix. Printed at startup so a stale copy is obvious.
-BUILD_ID = "2026-09-13.a (transport-vs-revert classification, nonce-guarded deploy retry, idempotent .env)"
+BUILD_ID = (
+    "2026-09-13.b (v0.6 fees on deploys, Studio-only estimator fallback, "
+    "tx-id recovery after a receipt timeout, non-destructive legacy ABI swap)"
+)
 
 import argparse
 import copy
@@ -159,6 +165,23 @@ FEE_UNSUPPORTED_MARKERS = (
     "no fee manager",
 )
 
+# Different thing: the *estimator* does not apply to this chain, even though the
+# chain does have fees. genlayer-py 0.19 implements
+# estimate_transaction_fees_for_write() on the Studio `sim_*` RPC surface only,
+# so on Bradbury it raises "Target write fee estimation is only supported on
+# Studio networks". That is permanent, so retrying it is pointless and treating
+# it as "this chain has no fees" is wrong — the generic
+# estimate_transaction_fees() prices the same call from the FeeManager.
+ESTIMATOR_UNSUPPORTED_MARKERS = (
+    "only supported on studio",
+    "only supported on studio networks",
+)
+
+
+def estimator_is_unsupported_here(error) -> bool:
+    text = str(error).lower()
+    return any(marker in text for marker in ESTIMATOR_UNSUPPORTED_MARKERS)
+
 
 # genlayer-py treats the all-zero distribution as "no fees provided" and falls
 # back to the legacy transaction shape, which a v0.6 node rejects outright with
@@ -205,35 +228,58 @@ def fee_kwargs(client, label: str, **estimate_kwargs) -> dict:
                 "messageAllocations": [],
             }
         }
+    # Which SDK entry point has to accept `fees` for this call to be worth pricing.
+    target = "write_contract" if estimate_kwargs else "deploy_contract"
+    if not sdk_supports_fees(client, target):
+        return {}
+
+    # Candidate estimators, most specific first.
+    #
+    # A deploy has no dedicated estimator at all — there is no
+    # estimate_transaction_fees_for_deploy() in genlayer-py — so a deploy goes
+    # straight to the generic one. A write prefers the call-specific estimator
+    # (it prices the actual calldata) but must fall back to the generic one on
+    # any non-Studio chain, where the specific one is not implemented.
+    candidates = []
     if estimate_kwargs:
-        if not sdk_supports_fees(client, "write_contract"):
-            return {}
-        estimator = getattr(client, "estimate_transaction_fees_for_write", None)
-    else:
-        if not sdk_supports_fees(client, "deploy_contract"):
-            return {}
-        estimator = getattr(client, "estimate_transaction_fees", None)
-    if estimator is None:
+        specific = getattr(client, "estimate_transaction_fees_for_write", None)
+        if specific is not None:
+            candidates.append(("per-call", specific, estimate_kwargs))
+    generic = getattr(client, "estimate_transaction_fees", None)
+    if generic is not None:
+        candidates.append(("generic", generic, {}))
+
+    if not candidates:
         print(f"  ! {label}: this genlayer-py has no fee estimator; sending without fees")
         return {}
+
     attempts = max(1, int(os.getenv("HOLDING_FEE_RETRIES", "10")))
     delay = float(os.getenv("HOLDING_FEE_RETRY_DELAY", "6"))
     last_error = None
-    for attempt in range(1, attempts + 1):
-        try:
-            return {"fees": as_fee_payload(estimator(**estimate_kwargs))}
-        except Exception as error:  # noqa: BLE001 - classification happens below
-            last_error = error
-            text = str(error).lower()
-            if any(marker in text for marker in FEE_UNSUPPORTED_MARKERS):
-                print(f"  ! {label}: this network does not support fee estimation; sending without fees")
-                return {}
-            if attempt < attempts:
-                print(
-                    f"  … {label}: fee estimate {attempt}/{attempts} failed "
-                    f"({str(error).splitlines()[0][:88]}); retrying in {delay:.0f}s"
-                )
-                time.sleep(delay)
+    for index, (kind, estimator, kwargs) in enumerate(candidates):
+        is_last = index == len(candidates) - 1
+        for attempt in range(1, attempts + 1):
+            try:
+                return {"fees": as_fee_payload(estimator(**kwargs))}
+            except Exception as error:  # noqa: BLE001 - classification happens below
+                last_error = error
+                text = str(error).lower()
+                if any(marker in text for marker in FEE_UNSUPPORTED_MARKERS):
+                    print(f"  ! {label}: this network does not support fee estimation; sending without fees")
+                    return {}
+                if estimator_is_unsupported_here(error) and not is_last:
+                    # Permanent for this chain: stop retrying, use the next estimator.
+                    print(
+                        f"  · {label}: the {kind} fee estimator is Studio-only; "
+                        "pricing this call with the generic estimator instead"
+                    )
+                    break
+                if attempt < attempts:
+                    print(
+                        f"  … {label}: fee estimate {attempt}/{attempts} failed "
+                        f"({str(error).splitlines()[0][:88]}); retrying in {delay:.0f}s"
+                    )
+                    time.sleep(delay)
     raise FeeEstimationUnavailable(f"{label}: {last_error}")
 
 
@@ -380,6 +426,72 @@ def raise_receipt_timeout(client, seconds: int) -> None:
     setattr(eth, "_holding_timeout_patched", True)
 
 
+def _discard_log_errors():
+    """web3's DISCARD sentinel, imported lazily.
+
+    web3 is only present with genlayer-py (the live extra), and this module is
+    imported by the test suite and by --dry-run on machines that have neither.
+    """
+    try:
+        from web3.logs import DISCARD
+
+        return DISCARD
+    except Exception:  # noqa: BLE001 - web3 absent; process_receipt default is fine
+        return None
+
+
+def recover_consensus_tx_id(client, evm_tx_hash: str, wait_seconds: float = 0.0):
+    """Turn a known EVM tx hash back into a consensus tx id.
+
+    The failure this exists for: genlayer-py submits the deploy with
+    eth_sendRawTransaction and then blocks in
+    w3.eth.wait_for_transaction_receipt(). If the EVM receipt does not appear in
+    time, web3 raises TimeExhausted ("... is not in the chain after 600
+    seconds") from *inside* the SDK, so the consensus tx id is never returned —
+    even though the transaction is on-chain and may finalize seconds later.
+
+    The EVM hash is in the error text, and the consensus tx id is in that
+    receipt's NewTransaction / CreatedTransaction log. Reading it back is the
+    difference between "resume automatically" and "go copy an address out of the
+    block explorer by hand".
+
+    Returns the consensus tx id, or "" when it genuinely cannot be recovered.
+    """
+    if client is None or not evm_tx_hash:
+        return ""
+    try:
+        if wait_seconds > 0:
+            receipt = client.w3.eth.wait_for_transaction_receipt(
+                evm_tx_hash, timeout=wait_seconds
+            )
+        else:
+            receipt = client.w3.eth.get_transaction_receipt(evm_tx_hash)
+    except Exception:  # noqa: BLE001 - still pending, or unreachable
+        return ""
+    if receipt is None or getattr(receipt, "status", 1) != 1:
+        return ""
+    try:
+        contract = client.w3.eth.contract(
+            abi=client.chain.consensus_main_contract["abi"]
+        )
+        for event_name in ("NewTransaction", "CreatedTransaction"):
+            try:
+                event = contract.get_event_by_name(event_name)
+            except Exception:  # noqa: BLE001 - not in this ABI
+                continue
+            discard = _discard_log_errors()
+            found = (
+                event.process_receipt(receipt, errors=discard)
+                if discard is not None
+                else event.process_receipt(receipt)
+            )
+            if found:
+                return client.w3.to_hex(found[0]["args"]["txId"])
+    except Exception:  # noqa: BLE001 - decoding is best effort
+        return ""
+    return ""
+
+
 def report_deploy_failure(
     label: str,
     error,
@@ -403,6 +515,18 @@ def report_deploy_failure(
         print(f"  transaction submitted: {tx}")
         if explorer:
             print(f"  {explorer}/tx/{tx}")
+        # The hash in the message is the EVM transaction. If it has since been
+        # mined, its receipt still carries the consensus tx id, so the deploy can
+        # be picked up here instead of by hand.
+        consensus_tx = recover_consensus_tx_id(client, tx)
+        if consensus_tx:
+            print(f"  recovered consensus tx: {consensus_tx}")
+            if explorer:
+                print(f"  {explorer}/tx/{consensus_tx}")
+            print("  the EVM transaction WAS mined — this deploy is live; do not re-run it.")
+            print("  wait for consensus, then resume with the address the explorer shows:")
+            print("      --registry-address 0x<THE ADDRESS THE EXPLORER SHOWS>")
+            return
         print("  it may still be processing — check the explorer above.")
         print("  if it finalised, resume without redeploying:")
         print("      --registry-address 0x<THE ADDRESS THE EXPLORER SHOWS>")
@@ -467,6 +591,21 @@ def deploy_with_retry(
             return client.deploy_contract(code=code, args=deploy_args, account=account, **fees)
         except Exception as error:  # noqa: BLE001 - classified below
             last_error = error
+            # The node accepted the EVM transaction but did not mine it before
+            # the SDK's receipt wait expired. The send is on-chain, so re-sending
+            # it would deploy a second registry. Recover the consensus tx id from
+            # the hash in the error and carry on with it.
+            evm_hash = extract_tx_hash(error)
+            if evm_hash:
+                grace = float(os.getenv("HOLDING_DEPLOY_RECOVER_WAIT", "120"))
+                print(
+                    f"  … {label}: the receipt wait expired, but EVM tx {evm_hash[:18]}… was "
+                    f"submitted; looking it up for up to {grace:.0f}s rather than re-sending"
+                )
+                recovered = recover_consensus_tx_id(client, evm_hash, wait_seconds=grace)
+                if recovered:
+                    print(f"  · {label}: recovered consensus tx {recovered}")
+                    return recovered
             if not is_transport_error(error):
                 raise
             nonce_now = read_nonce(client, account)
@@ -541,10 +680,29 @@ CONSENSUS_ABI_MODE = (os.environ.get("HOLDING_CONSENSUS_ABI") or "auto").strip()
 
 
 def with_legacy_consensus_abi(chain):
-    """Return a copy of `chain` whose consensus ABI is the pre-fee shape."""
+    """Return a copy of `chain` whose addTransaction is the pre-fee shape.
+
+    Only the addTransaction entry is replaced. Everything else in the ABI is
+    kept, because genlayer-py reads the transaction id back out of the receipt
+    by decoding the NewTransaction / CreatedTransaction events against this very
+    ABI:
+
+        new_tx_event = consensus_main_contract.get_event_by_name("NewTransaction")
+
+    Replacing the whole ABI with a single function entry deletes those events,
+    so the SDK can no longer resolve the tx id and raises instead of returning
+    it — the deploy is left running on-chain with nothing to report. Keeping the
+    rest of the ABI is what makes the fallback survivable.
+    """
     patched = copy.deepcopy(chain)
     contract = dict(patched.consensus_main_contract or {})
-    contract["abi"] = LEGACY_ADD_TRANSACTION_ABI
+    original = list(contract.get("abi") or [])
+    kept = [
+        entry
+        for entry in original
+        if not (isinstance(entry, dict) and entry.get("name") == "addTransaction")
+    ]
+    contract["abi"] = LEGACY_ADD_TRANSACTION_ABI + kept
     patched.consensus_main_contract = contract
     return patched
 
