@@ -8,4 +8,4 @@
 #
 # 0.18.0 is listed below only for reference: it can still READ a live network,
 # but every write will be rejected by a v0.6 node.
-genlayer-py==0.19.0rc2
+genlayer-py==0.19.0
