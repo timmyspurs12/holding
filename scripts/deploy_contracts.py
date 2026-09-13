@@ -30,12 +30,23 @@ Notes
 * Deploying is not the last step. The registry refuses holdings from
   unregistered contracts, so this script also calls register_source() for the
   adjudicator and register_attestor() for you. Use --no-register to skip that.
+* A dropped connection is not a verdict from the chain, and is never treated as
+  one. The consensus-ABI probe distinguishes a revert (this network has no fee
+  machinery) from a transport failure (no answer at all) and refuses to guess:
+  it retries, then stops and asks for --consensus-abi fees|legacy. Pass that
+  flag to skip the probe entirely.
+* Deploys are retried only when the account nonce proves the previous attempt
+  never landed, so a flaky link cannot produce a duplicate registry. Tunables:
+  HOLDING_DEPLOY_RETRIES (default 3), HOLDING_DEPLOY_RETRY_DELAY (default 15s),
+  HOLDING_ABI_PROBE_RETRIES (default 5), HOLDING_ABI_PROBE_DELAY (default 5s).
+* --write-env replaces a marked block in .env rather than appending, so
+  resuming a partial deploy cannot leave two competing sets of addresses.
 """
 
 from __future__ import annotations
 
 # Bump with every fix. Printed at startup so a stale copy is obvious.
-BUILD_ID = "2026-09-11.c (pre-fee consensus ABI fallback, fee retry, finality timeout)"
+BUILD_ID = "2026-09-13.a (transport-vs-revert classification, nonce-guarded deploy retry, idempotent .env)"
 
 import argparse
 import copy
@@ -285,6 +296,72 @@ def extract_tx_hash(error) -> str:
     return match.group(0) if match else ""
 
 
+# --- transport failures are not contract verdicts ---------------------------
+# A dropped socket and a contract revert are indistinguishable to a bare
+# `except Exception`, but they mean opposite things: a revert is an *answer*
+# from the chain, a dropped socket is *no answer at all*. Conflating the two is
+# what made this script guess the consensus ABI from a network blip and then
+# report "nothing was submitted" for a deploy the node may already have
+# accepted. Every classification below goes through is_transport_error().
+TRANSPORT_ERROR_MARKERS = (
+    "connection aborted",
+    "connection reset",
+    "connection refused",
+    "connection broken",
+    "connectionbroken",
+    "remotedisconnected",
+    "incompleteread",
+    "max retries exceeded",
+    "failed to establish a new connection",
+    "temporarily failed to resolve",
+    "name or service not known",
+    "nodename nor servname",
+    "timed out",
+    "timeout",
+    "bad gateway",
+    "service unavailable",
+    "gateway time-out",
+    # Windows Winsock codes: the host stack tore the connection down.
+    "10053",
+    "10054",
+    "10060",
+    "10061",
+)
+
+
+class NetworkUnavailable(RuntimeError):
+    """The RPC could not be reached, so the chain returned no verdict at all."""
+
+
+def is_transport_error(error) -> bool:
+    """True when `error` means "the request never got an answer".
+
+    Exception *type* is trusted only for the builtin network errors; everything
+    else is classified by message text, because web3 and requests wrap transport
+    failures in their own exception types (a requests ConnectionError is not the
+    builtin one) while leaving the underlying Winsock text in the message.
+    """
+    if isinstance(error, (ConnectionError, TimeoutError)):
+        return True
+    text = str(error).lower()
+    return any(marker in text for marker in TRANSPORT_ERROR_MARKERS)
+
+
+def read_nonce(client, account):
+    """The account's transaction count, or None when it cannot be read.
+
+    None is deliberately distinct from a number. A nonce we failed to read is
+    NOT evidence that nothing was sent, and every caller must treat it that way
+    rather than defaulting to "safe to retry".
+    """
+    if client is None or account is None:
+        return None
+    try:
+        return client.w3.eth.get_transaction_count(account.address)
+    except Exception:  # noqa: BLE001 - an unreadable nonce is itself informative
+        return None
+
+
 def raise_receipt_timeout(client, seconds: int) -> None:
     """Give the underlying web3 receipt wait more than its 120 s default.
 
@@ -303,7 +380,23 @@ def raise_receipt_timeout(client, seconds: int) -> None:
     setattr(eth, "_holding_timeout_patched", True)
 
 
-def report_deploy_failure(label: str, error, explorer: str) -> None:
+def report_deploy_failure(
+    label: str,
+    error,
+    explorer: str,
+    client=None,
+    account=None,
+    nonce_before=None,
+) -> None:
+    """Report a failed deploy without claiming more than the evidence supports.
+
+    The absence of a tx hash in the error text is NOT proof that nothing was
+    submitted: a socket can be aborted after the node already accepted
+    eth_sendRawTransaction, and then the reply — hash included — never arrives.
+    Telling the operator "nothing was submitted" invites a re-run that leaves a
+    second registry behind, so the nonce settles it when it can and the output
+    says plainly when it cannot.
+    """
     print(f"\n{label} did not return cleanly: {error}")
     tx = extract_tx_hash(error)
     if tx:
@@ -313,8 +406,80 @@ def report_deploy_failure(label: str, error, explorer: str) -> None:
         print("  it may still be processing — check the explorer above.")
         print("  if it finalised, resume without redeploying:")
         print("      --registry-address 0x<THE ADDRESS THE EXPLORER SHOWS>")
-    else:
-        print("  no transaction hash was returned, so nothing was submitted.")
+        return
+
+    if not is_transport_error(error):
+        # The chain answered, and the answer was no. Nothing was submitted.
+        print("  no transaction hash was returned; the node rejected the call.")
+        return
+
+    print("  this was a network/transport failure — the chain returned no verdict.")
+    nonce_now = read_nonce(client, account)
+    if nonce_before is not None and nonce_now is not None:
+        if nonce_now != nonce_before:
+            print(f"  ! the deployer nonce moved {nonce_before} -> {nonce_now}, so a transaction")
+            print("    WAS submitted even though the connection dropped. Do NOT re-run as-is;")
+            print("    check whether it landed:")
+            if explorer and account is not None:
+                print(f"      {explorer}/address/{account.address}")
+            print("    if it finalised, resume without redeploying:")
+            print("      --registry-address 0x<THE ADDRESS THE EXPLORER SHOWS>")
+        else:
+            print(f"  the deployer nonce is unchanged at {nonce_now}, so nothing was submitted.")
+            print("  re-running is safe once the connection is stable.")
+        return
+
+    print("  whether it was submitted cannot be proven from here (the nonce could not be")
+    print("  read, or was not captured before the send). CHECK THE EXPLORER FIRST:")
+    if explorer and account is not None:
+        print(f"      {explorer}/address/{account.address}")
+    print("  re-running on top of a deploy that did land leaves two registries behind.")
+
+
+def deploy_with_retry(
+    client,
+    code: str,
+    deploy_args: list,
+    account,
+    fees: dict,
+    label: str,
+    attempts: int = 0,
+    delay: float = 0.0,
+) -> str:
+    """Send a deploy, retrying only when the nonce proves nothing was submitted.
+
+    A deploy is the largest request of the whole run — the entire contract
+    source travels in calldata, ~29 kB for HoldingRegistry — so it is the call
+    most likely to be cut off by an unstable link or an over-eager firewall, and
+    it previously had no retry at all while fee estimation had ten.
+
+    Retrying a *send* is not free: a blind retry duplicates a deploy that
+    actually landed. The nonce is therefore the gate. Unchanged means the send
+    was genuinely lost and can be repeated; moved OR unreadable means we cannot
+    prove it was lost, so the error propagates to report_deploy_failure instead.
+    """
+    attempts = attempts or max(1, int(os.getenv("HOLDING_DEPLOY_RETRIES", "3")))
+    delay = delay or float(os.getenv("HOLDING_DEPLOY_RETRY_DELAY", "15"))
+    nonce_before = read_nonce(client, account)
+    last_error = None
+    for attempt in range(1, attempts + 1):
+        try:
+            return client.deploy_contract(code=code, args=deploy_args, account=account, **fees)
+        except Exception as error:  # noqa: BLE001 - classified below
+            last_error = error
+            if not is_transport_error(error):
+                raise
+            nonce_now = read_nonce(client, account)
+            if nonce_before is None or nonce_now is None or nonce_now != nonce_before:
+                # Cannot prove the send was lost, so never re-send it.
+                raise
+            if attempt < attempts:
+                print(
+                    f"  … {label} attempt {attempt}/{attempts} lost the connection; nonce still "
+                    f"{nonce_now}, nothing was submitted — retrying in {delay:.0f}s"
+                )
+                time.sleep(delay)
+    raise last_error
 
 
 def write_and_wait(client, registry_address: str, function: str, args: list, label: str, account=None) -> bool:
@@ -384,13 +549,41 @@ def with_legacy_consensus_abi(chain):
     return patched
 
 
-def fee_aware_selector_is_live(client) -> bool:
-    """True when the network still answers the v0.6 fee policy call."""
-    try:
-        client.get_current_fee_policy()
-        return True
-    except Exception:  # noqa: BLE001 - a revert here is the signal we want
-        return False
+def fee_aware_selector_is_live(client, attempts: int = 0, delay: float = 0.0) -> bool:
+    """True when the network answers the v0.6 fee policy call.
+
+    Only a *revert* proves the fee-bearing addTransaction is missing here. A
+    dropped socket proves nothing about the chain, so transport failures are
+    retried and then surfaced as NetworkUnavailable rather than silently
+    downgrading the deploy to the pre-fee ABI. That downgrade is not harmless:
+    on a genuine v0.6 network it also forces fees off, which reproduces the
+    exact "reverts with no reason" / FeesDistributionMissing failure this
+    fallback exists to avoid — so one lost packet would decide the protocol
+    shape for the whole run.
+    """
+    attempts = attempts or max(1, int(os.getenv("HOLDING_ABI_PROBE_RETRIES", "5")))
+    delay = delay or float(os.getenv("HOLDING_ABI_PROBE_DELAY", "5"))
+    last_error = None
+    for attempt in range(1, attempts + 1):
+        try:
+            client.get_current_fee_policy()
+            return True
+        except Exception as error:  # noqa: BLE001 - classified below
+            last_error = error
+            if not is_transport_error(error):
+                return False  # a genuine revert: this chain has no fee machinery
+            if attempt < attempts:
+                print(
+                    f"  … fee-policy probe {attempt}/{attempts} could not reach the RPC "
+                    f"({str(error).splitlines()[0][:80]}); retrying in {delay:.0f}s"
+                )
+                time.sleep(delay)
+    raise NetworkUnavailable(
+        f"could not reach the RPC to determine the consensus ABI (last error: {last_error}). "
+        "A dropped connection says nothing about which ABI this network implements, so "
+        "refusing to guess. Restore the connection and re-run, or decide explicitly with "
+        "--consensus-abi fees (v0.6 fee-bearing) or --consensus-abi legacy (pre-fee)."
+    )
 
 
 def inject_estimate_gas(client, gas_limit: int) -> None:
@@ -511,6 +704,43 @@ def run_diagnose(client, args, account, chain_name) -> int:
         print("\n  FINAL DIAGNOSIS: the network rejects this transaction before")
         print("  consensus. Nothing was sent.")
         return 1
+
+
+# The .env region this script owns. Marked so a re-run replaces it instead of
+# stacking a second copy underneath the first.
+ENV_BLOCK_BEGIN = "# >>> HOLDING deploy (managed by scripts/deploy_contracts.py) >>>"
+ENV_BLOCK_END = "# <<< HOLDING deploy (managed by scripts/deploy_contracts.py) <<<"
+
+
+def write_env_block(body: str) -> str:
+    """Write the deploy addresses into .env, replacing any previous block.
+
+    A bare append is not idempotent, and the failure is silent: a resumed deploy
+    leaves two HOLDING_REGISTRY_ADDRESS lines, python-dotenv keeps the last one,
+    and the app quietly switches to a different registry than the one the
+    sources and attestors were registered on. Replacing a marked region makes
+    re-running safe however many times a deploy was resumed.
+
+    Returns a short description of what it did, for the operator.
+    """
+    path = ROOT / ".env"
+    managed = f"{ENV_BLOCK_BEGIN}\n{body.strip()}\n{ENV_BLOCK_END}\n"
+    existing = path.read_text(encoding="utf-8") if path.exists() else ""
+    pattern = re.compile(
+        re.escape(ENV_BLOCK_BEGIN) + r".*?" + re.escape(ENV_BLOCK_END) + r"\n?",
+        re.DOTALL,
+    )
+    if pattern.search(existing):
+        # A lambda keeps `managed` literal: re.sub would otherwise interpret any
+        # backslash or group reference inside the addresses.
+        updated = pattern.sub(lambda _match: managed, existing)
+        action = "updated the managed block in .env"
+    else:
+        prefix = existing.rstrip("\n")
+        updated = (prefix + "\n\n" if prefix else "") + managed
+        action = "appended a managed block to .env"
+    path.write_text(updated, encoding="utf-8")
+    return action
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -636,8 +866,20 @@ def main(argv: list[str] | None = None) -> int:
     # ABI, which the live contract does accept.
     global FINALITY_TIMEOUT_S, FEE_MODE, CONSENSUS_ABI_MODE
     CONSENSUS_ABI_MODE = args.consensus_abi
+    # An explicit --consensus-abi is an instruction, not a hint: honour it
+    # without probing, so a flaky link can never override it and no needless
+    # RPC round-trip stands between the operator and the deploy.
+    if CONSENSUS_ABI_MODE == "auto":
+        try:
+            fee_selector_live = fee_aware_selector_is_live(client)
+        except NetworkUnavailable as error:
+            print(f"\n  ! {error}")
+            return 1
+    else:
+        fee_selector_live = CONSENSUS_ABI_MODE == "fees"
+        print(f"  · consensus ABI forced to {'fee-bearing (v0.6)' if fee_selector_live else 'legacy (pre-fee)'} by --consensus-abi")
     use_legacy = CONSENSUS_ABI_MODE == "legacy" or (
-        CONSENSUS_ABI_MODE == "auto" and not fee_aware_selector_is_live(client)
+        CONSENSUS_ABI_MODE == "auto" and not fee_selector_live
     )
     if use_legacy:
         print(
@@ -675,12 +917,15 @@ def main(argv: list[str] | None = None) -> int:
     else:
         # 1 · registry
         registry_fees = fee_kwargs(client, "registry deploy")
+        nonce_before = read_nonce(client, account)
         try:
-            registry_tx = client.deploy_contract(
-                code=registry_code, args=[owner], account=account, **registry_fees
+            registry_tx = deploy_with_retry(
+                client, registry_code, [owner], account, registry_fees, "registry deploy"
             )
         except Exception as error:  # noqa: BLE001 - the tx hash is inside the message
-            report_deploy_failure("registry deploy", error, explorer)
+            report_deploy_failure(
+                "registry deploy", error, explorer, client, account, nonce_before
+            )
             return 1
         print(f"registry deploy tx    {registry_tx}")
         if explorer:
@@ -701,15 +946,20 @@ def main(argv: list[str] | None = None) -> int:
     elif adjudicator_code:
         # 2 · adjudicator — same fee note as above
         adjudicator_fees = fee_kwargs(client, "adjudicator deploy")
+        nonce_before = read_nonce(client, account)
         try:
-            adjudicator_tx = client.deploy_contract(
-                code=adjudicator_code,
-                args=[registry_address, args.domain, args.contract_class, args.panel_size],
-                account=account,
-                **adjudicator_fees,
+            adjudicator_tx = deploy_with_retry(
+                client,
+                adjudicator_code,
+                [registry_address, args.domain, args.contract_class, args.panel_size],
+                account,
+                adjudicator_fees,
+                "adjudicator deploy",
             )
         except Exception as error:  # noqa: BLE001 - the tx hash is inside the message
-            report_deploy_failure("adjudicator deploy", error, explorer)
+            report_deploy_failure(
+                "adjudicator deploy", error, explorer, client, account, nonce_before
+            )
             return 1
         print(f"adjudicator deploy tx {adjudicator_tx}")
         if explorer:
@@ -758,9 +1008,7 @@ HOLDING_DEMO_SEED=false
     print(env_block.strip())
 
     if args.write_env:
-        with open(ROOT / ".env", "a", encoding="utf-8") as handle:
-            handle.write(env_block)
-        print("\nappended to .env (git-ignored)")
+        print(f"\n{write_env_block(env_block)} (git-ignored)")
 
     print("\nnext:")
     print("  1. restart the Reporter API so it picks up the new addresses")
